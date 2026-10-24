@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>pi — мост</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#dfe3ea; --dim:#8a93a6;
+    --accent:#4da3ff; --user:#2b5d8f; --ok:#3fb96f; --warn:#e0a93e; --err:#e05555;
+    --mono:'Sarasa Mono SC','DejaVu Sans Mono',ui-monospace,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font:15px/1.45 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+    display:flex; flex-direction:column;
+  }
+  header{
+    display:flex; align-items:center; gap:8px; padding:8px 12px;
+    background:var(--panel); border-bottom:1px solid var(--line);
+    padding-top:calc(8px + env(safe-area-inset-top));
+  }
+  #dot{width:10px;height:10px;border-radius:50%;background:var(--err);flex:none}
+  #dot.ok{background:var(--ok)} #dot.warn{background:var(--warn)}
+  #model{color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  header button{
+    background:none;border:1px solid var(--line);color:var(--dim);border-radius:8px;
+    padding:4px 10px;font-size:12px;
+  }
+  #log{flex:1;overflow-y:auto;padding:10px 12px 16px;-webkit-overflow-scrolling:touch}
+  .row{margin:6px 0;word-wrap:break-word;white-space:pre-wrap;overflow-wrap:anywhere}
+  .user{background:var(--user);border-radius:12px 12px 3px 12px;padding:8px 12px;max-width:92%}
+  .assistant{padding:2px 2px}
+  .thinking{color:var(--dim);font-size:13px;font-style:italic}
+  .thinking summary{cursor:pointer;list-style:none;color:var(--dim);font-size:12px}
+  .tool{font-family:var(--mono);font-size:12.5px;color:var(--dim);border-left:2px solid var(--line);padding:2px 0 2px 10px;margin:6px 0}
+  .tool b{color:var(--text);font-weight:600}
+  .tool .st{color:var(--warn)} .tool.done .st{color:var(--ok)} .tool.err .st{color:var(--err)}
+  .sys{color:var(--dim);font-size:12px;font-family:var(--mono)}
+  .sys.err{color:var(--err)}
+  details.raw{color:var(--dim);font-size:11.5px;font-family:var(--mono)}
+  details.raw summary{cursor:pointer}
+  #jump{
+    position:absolute;right:14px;bottom:86px;display:none;
+    border:1px solid var(--line);background:var(--panel);color:var(--text);
+    border-radius:20px;padding:8px 14px;
+  }
+  #bar{
+    border-top:1px solid var(--line);background:var(--panel);
+    padding:8px 10px calc(8px + env(safe-area-inset-bottom));
+  }
+  #ctrl{display:none;align-items:center;gap:8px;margin-bottom:6px;font-size:12px;color:var(--dim)}
+  #ctrl.on{display:flex}
+  #runbadge{color:var(--warn)}
+  #qinfo{flex:1}
+  #ctrl button{border:1px solid var(--line);background:none;color:var(--text);border-radius:8px;padding:4px 10px;font-size:12px}
+  #ctrl button.stop{border-color:var(--err);color:var(--err)}
+  #mode.steer{color:var(--accent)} #mode.follow{color:var(--ok)}
+  #inrow{display:flex;gap:8px;align-items:flex-end}
+  textarea{
+    flex:1;resize:none;background:var(--bg);color:var(--text);
+    border:1px solid var(--line);border-radius:12px;padding:9px 12px;
+    font:inherit;max-height:120px;outline:none;
+  }
+  textarea:focus{border-color:var(--accent)}
+  #send{
+    flex:none;border:none;border-radius:12px;background:var(--accent);color:#fff;
+    padding:10px 16px;font:inherit;font-weight:600;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div id="dot"></div>
+  <div id="model">подключение…</div>
+  <button id="new">новая сессия</button>
+</header>
+
+<div id="log"></div>
+<button id="jump">вниз</button>
+
+<div id="bar">
+  <div id="ctrl">
+    <span id="runbadge">агент работает</span>
+    <span id="qinfo"></span>
+    <button id="mode" class="steer">steer</button>
+    <button id="abort" class="stop">стоп</button>
+  </div>
+  <div id="inrow">
+    <textarea id="in" rows="1" placeholder="Сообщение…"></textarea>
+    <button id="send">Отправить</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const logEl = $('log'), dot = $('dot'), modelEl = $('model'), inEl = $('in');
+
+let ws = null, retryMs = 1000, closedByUs = false;
+let streaming = false;          // агент работает
+let mode = 'steer';             // steer | follow_up — куда уйдёт сообщение во время стриминга
+let stick = true;               // прилеплены ли к низу лога
+let lastSent = '';              // для дедупликации эха user-сообщений
+let historyDone = false;        // история от get_messages отрисована
+let curText = null;             // текущий ассистентский текстовый блок
+let curThink = null;            // текущий thinking-блок (details)
+const toolLines = new Map();    // toolCallId -> элемент строки инструмента
+
+/* ---------- утилиты DOM ---------- */
+function scrollBottom(){ logEl.scrollTop = logEl.scrollHeight; }
+function checkStick(){ stick = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 90; }
+function add(el){ checkStick(); logEl.appendChild(el); if (stick) scrollBottom(); }
+function div(cls, text){ const d = document.createElement('div'); if (cls) d.className = cls; if (text != null) d.textContent = text; return d; }
+function sysLine(text, isErr){ const d = div('sys' + (isErr ? ' err' : ''), text); add(d); return d; }
+function rawDetails(label, obj){
+  const det = document.createElement('details'); det.className = 'raw';
+  const s = document.createElement('summary'); s.textContent = label; det.appendChild(s);
+  det.appendChild(document.createTextNode(JSON.stringify(obj, null, 1).slice(0, 4000)));
+  return det;
+}
+function short(s, n){ s = String(s); return s.length > n ? s.slice(0, n) + '…' : s; }
+
+/* ---------- рендер лога ---------- */
+function userBubble(text){ add(div('row user', text)); }
+
+function ensureText(){
+  if (!curText){ curText = div('row assistant', ''); add(curText); }
+  return curText;
+}
+function ensureThink(){
+  if (!curThink){
+    const det = document.createElement('details'); det.className = 'row thinking';
+    const s = document.createElement('summary'); s.textContent = 'размышления';
+    det.appendChild(s);
+    const body = document.createElement('div'); det.appendChild(body);
+    det._body = body; add(det); curThink = det;
+  }
+  return curThink._body;
+}
+function closeStreams(){ curText = null; curThink = null; }
+
+function toolLineStart(id, name, args){
+  const d = div('tool');
+  d.innerHTML = ''; // безопасность: собираем узлами
+  const b = document.createElement('b'); b.textContent = name || 'tool'; d.appendChild(b);
+  const st = document.createElement('span'); st.className = 'st'; st.textContent = ' …'; d.appendChild(st);
+  const pre = document.createElement('div'); pre.textContent = args ? short(JSON.stringify(args), 300) : '';
+  pre.style.whiteSpace = 'pre-wrap'; d.appendChild(pre);
+  d._st = st;
+  if (id) toolLines.set(id, d);
+  add(d);
+  return d;
+}
+function toolLineEnd(id, isError, resultText){
+  const d = id && toolLines.get(id);
+  if (!d) return;
+  d.classList.add(isError ? 'err' : 'done');
+  d._st.textContent = isError ? ' ошибка' : ' готово';
+  if (resultText){
+    const det = document.createElement('details');
+    const s = document.createElement('summary'); s.textContent = 'результат';
+    det.appendChild(s);
+    det.appendChild(document.createTextNode(short(resultText, 6000)));
+    d.appendChild(det);
+  }
+  toolLines.delete(id);
+}
+
+function renderHistory(messages){
+  if (!Array.isArray(messages)) return;
+  for (const m of messages){
+    try { renderHistoryMessage(m); } catch (e) { add(rawDetails('сообщение (не разобрано)', m)); }
+  }
+  sysLine('— история сессии (' + messages.length + ' сообщений) —');
+}
+function contentText(c){
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.filter(b => b && (b.type === 'text' || typeof b === 'string'))
+    .map(b => typeof b === 'string' ? b : b.text).join('');
+  return c && c.text ? c.text : '';
+}
+function renderHistoryMessage(m){
+  const role = m.role || (m.message && m.message.role);
+  const content = m.content != null ? m.content : (m.message && m.message.content);
+  if (role === 'user'){ userBubble(contentText(content) || '[пусто]'); return; }
+  if (role === 'assistant'){
+    if (Array.isArray(content)){
+      for (const b of content){
+        if (!b || typeof b !== 'object') continue;
+        if (b.type === 'text' && b.text) add(div('row assistant', b.text));
+        else if (b.type === 'thinking' && b.thinking) add(div('row thinking', short(b.thinking, 800)));
+        else if (/toolcall|tool_call|toolCall/.test(b.type || '')){
+          toolLineStart(null, b.name || b.toolName || 'tool', b.arguments || b.args || null);
+        } else add(rawDetails('блок ' + (b.type || '?'), b));
+      }
+    } else if (contentText(content)) add(div('row assistant', contentText(content)));
+    return;
+  }
+  if (/tool/i.test(role || '')){
+    const t = contentText(content);
+    if (t) add(div('sys', 'результат инструмента: ' + short(t, 300)));
+    return;
+  }
+  add(rawDetails('роль ' + (role || '?'), m));
+}
+
+/* ---------- обработка событий pi ---------- */
+function setStatus(cls, text){ dot.className = cls; modelEl.textContent = text; }
+function setStreaming(v){
+  streaming = v;
+  $('ctrl').classList.toggle('on', v);
+  $('mode').textContent = mode === 'steer' ? 'steer' : 'follow-up';
+  $('mode').className = mode === 'steer' ? 'steer' : 'follow';
+}
+
+function handleEvent(o){
+  switch (o.type){
+    case 'response': {
+      if (o.command === 'get_state'){
+        if (o.success){
+          const m = o.data && o.data.model;
+          const name = m ? (m.name || m.id) : 'модель не выбрана';
+          setStatus('ok', 'pi · ' + name + (o.data && o.data.isStreaming ? ' · работает' : ''));
+          setStreaming(!!(o.data && o.data.isStreaming));
+        }
+        break;
+      }
+      if (o.command === 'get_messages'){
+        if (o.success && !historyDone){
+          historyDone = true;
+          renderHistory(o.data && o.data.messages);
+        }
+        break;
+      }
+      if (o.command === 'new_session' && o.success){
+        logEl.textContent = ''; toolLines.clear(); closeStreams();
+        sysLine('— начата новая сессия —');
+        break;
+      }
+      if (o.command === 'prompt' || o.command === 'steer' || o.command === 'follow_up'){
+        const d = o.data || {};
+        sysLine((o.command === 'prompt' ? 'отправлено' : 'в очередь (' + o.command + ')') +
+          (o.success ? ' [' + (d.disposition || 'ok') + ']' : '') + (o.success ? '' : ': ' + (o.error || 'ошибка')), !o.success);
+        break;
+      }
+      if (o.success === false) sysLine(o.command + ': ' + (o.error || 'ошибка'), true);
+      break;
+    }
+    case 'message_start': {
+      const m = o.message || {};
+      if (m.role === 'user'){
+        const t = contentText(m.content);
+        if (t && t === lastSent) break;      // свой локальный эхо уже показан
+        userBubble(t || '[пусто]');
+      }
+      break;
+    }
+    case 'message_update': {
+      const e = o.assistantMessageEvent;
+      if (!e) break;
+      switch (e.type){
+        case 'text_start': curThink = null; curText = null; ensureText(); break;
+        case 'text_delta': ensureText().textContent += e.delta || ''; break;
+        case 'text_end': curText = null; break;
+        case 'thinking_start': curText = null; ensureThink(); break;
+        case 'thinking_delta': ensureThink().textContent += e.delta || ''; break;
+        case 'thinking_end': curThink = null; break;
+        case 'toolcall_start': closeStreams(); toolLineStart(e.id, e.toolName, null); break;
+        case 'toolcall_delta': break; // накопление аргументов не показываем
+        case 'toolcall_end': {
+          const tc = e.toolCall || {};
+          const d = e.id && toolLines.get(e.id);
+          if (d && !d._argsShown){
+            const pre = d.children[2];
+            pre.textContent = short(JSON.stringify(tc.arguments || tc.args || tc), 300);
+          }
+          break;
+        }
+        case 'error': sysLine('ошибка модели: ' + (e.error || e.reason), true); break;
+        default: break; // start/done и пр. — служебные
+      }
+      break;
+    }
+    case 'tool_execution_start':
+      toolLineStart(o.toolCallId, o.toolName, o.args);
+      break;
+    case 'tool_execution_update': break; // частичный вывод не спамим в лог
+    case 'tool_execution_end': {
+      const r = o.result || {};
+      const text = Array.isArray(r.content)
+        ? r.content.filter(b => b && b.type === 'text').map(b => b.text).join('\n')
+        : (typeof r === 'string' ? r : '');
+      toolLineEnd(o.toolCallId, !!o.isError, text);
+      break;
+    }
+    case 'agent_start': setStreaming(true); break;
+    case 'agent_end': if (o.willRetry) sysLine('агент завершит попытку и повторит…'); break;
+    case 'agent_settled': setStreaming(false); break;
+    case 'queue_update': {
+      const s = (o.steering || []).length, f = (o.followUp || []).length;
+      $('qinfo').textContent = (s || f) ? ('в очереди: ' + (s ? s + ' steer ' : '') + (f ? f + ' follow' : '')) : '';
+      break;
+    }
+    case 'auto_retry_start': sysLine('auto-retry #' + o.attempt + ' через ' + o.delayMs + ' мс: ' + (o.errorMessage || ''), true); break;
+    case 'compaction_start': sysLine('компакция контекста…'); break;
+    case 'compaction_end': sysLine('компакция завершена'); break;
+    case 'bash_execution_update': break; // живой вывод bash в лог не дублируем
+    case 'extension_ui_request': add(rawDetails('запрос UI расширения (не поддержан)', o)); break;
+    default:
+      if (!/^bridge_/.test(o.type || '')) add(rawDetails(o.type || 'unknown', o));
+  }
+}
+
+/* служебные события моста */
+function handleBridge(o){
+  switch (o.type){
+    case 'bridge_hello':
+      setStatus(o.piRunning ? 'ok' : 'warn', o.piRunning ? 'pi запущен' : 'pi не запущен');
+      sysLine('мост: ' + o.cmd + ' · cwd: ' + o.cwd);
+      break;
+    case 'bridge_status':
+      if (o.status === 'pi_up') setStatus('ok', 'pi запущен');
+      else if (o.status === 'pi_down'){ setStatus('warn', 'pi упал, перезапуск…'); setStreaming(false); sysLine('процесс pi завершился (code=' + o.code + ')'); }
+      else if (o.status === 'pi_error'){ setStatus('err', 'ошибка pi'); sysLine('pi: ' + o.error, true); }
+      break;
+    case 'bridge_stderr': sysLine('pi stderr: ' + short(o.line, 500), true); break;
+    case 'bridge_raw': sysLine('pi stdout (не JSON): ' + short(o.line, 500)); break;
+    case 'bridge_error': sysLine('мост: ' + o.error, true); break;
+  }
+}
+
+/* ---------- WebSocket ---------- */
+function connect(){
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const base = location.pathname.replace(/\/+$/, '');
+  setStatus('warn', 'подключение…');
+  ws = new WebSocket(proto + '://' + location.host + base + '/ws');
+  ws.onopen = () => { retryMs = 1000; sysLine('— соединение установлено —'); };
+  ws.onmessage = (ev) => {
+    let o; try { o = JSON.parse(ev.data); } catch { return; }
+    if (/^bridge_/.test(o.type || '')) handleBridge(o); else handleEvent(o);
+  };
+  ws.onclose = () => {
+    if (closedByUs) return;
+    setStatus('err', 'нет связи');
+    setStreaming(false);
+    setTimeout(connect, retryMs);
+    retryMs = Math.min(retryMs * 1.7, 10000);
+  };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && (!ws || ws.readyState === ws.CLOSED)) connect();
+});
+
+/* ---------- отправка ---------- */
+function send(){
+  const text = inEl.value.trim();
+  if (!text) return;
+  if (!ws || ws.readyState !== ws.OPEN){ sysLine('нет соединения', true); return; }
+  const msg = streaming
+    ? { id: 'c' + Date.now(), type: mode, message: text }
+    : { id: 'c' + Date.now(), type: 'prompt', message: text };
+  ws.send(JSON.stringify(msg));
+  lastSent = text;
+  userBubble(text + (streaming ? (mode === 'steer' ? '  [steer]' : '  [follow-up]') : ''));
+  inEl.value = ''; inEl.style.height = 'auto';
+}
+$('send').onclick = send;
+inEl.addEventListener('input', () => { inEl.style.height = 'auto'; inEl.style.height = Math.min(inEl.scrollHeight, 120) + 'px'; });
+inEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)){ e.preventDefault(); send(); }
+});
+$('abort').onclick = () => { if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'abort' })); };
+$('mode').onclick = () => { mode = mode === 'steer' ? 'follow_up' : 'steer'; setStreaming(streaming); };
+$('new').onclick = () => {
+  if (!confirm('Начать новую сессию? Текущая сохранится в файле сессий pi.')) return;
+  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'new_session' }));
+};
+$('jump').onclick = () => { stick = true; scrollBottom(); };
+logEl.addEventListener('scroll', () => {
+  const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 90;
+  stick = atBottom; $('jump').style.display = atBottom ? 'none' : 'block';
+});
+
+connect();
+</script>
+</body>
+</html>

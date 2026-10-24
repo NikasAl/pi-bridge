@@ -1,0 +1,14 @@
+{
+  "name": "pi-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Минимальный WebSocket-мост к pi coding agent (RPC-режим): лог стриминга + отправка сообщений/steering с телефона",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
