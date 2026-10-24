@@ -301,11 +301,17 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   allClients.add(ws);
   log(`[ws] client connected (total=${allClients.size})`);
-  // авто-привязка: к активной сессии клиента нет — берём первую (или создаём)
-  const first = [...sessions.values()][0] || createSession();
+  // авто-привязка: клиент помнит свою сессию (?session=<id> из localStorage на телефоне);
+  // если её нет (удалили) — фолбэк на первую (или создаём)
+  let preferred = null;
+  try {
+    const q = new URL(req.url, 'http://localhost').searchParams.get('session');
+    if (q && sessions.has(q)) preferred = sessions.get(q);
+  } catch {}
+  const first = preferred || [...sessions.values()][0] || createSession();
   attach(ws, first);
 
   ws.on('message', (data) => {

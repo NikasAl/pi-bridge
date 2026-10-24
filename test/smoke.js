@@ -4,7 +4,8 @@
  *   A) базовый цикл: hello/get_state/get_messages, prompt (plain text), стрим событий;
  *   B) переподключение: строгая проверка, что дельты НЕ задваиваются;
  *   C) мульти-сессии: create/attach/rename/delete + get_session_stats;
- *   D) md.js: рендер маркдауна и защита от XSS.
+ *   D) preferred session: reconnect с ?session=<id> остаётся на своей сессии;
+ *   E) md.js: рендер маркдауна и защита от XSS.
  * Запуск: node test/smoke.js   (или npm test)
  */
 'use strict';
@@ -57,8 +58,8 @@ function testMd() {
 }
 
 /* ---------- подключение клиента с накоплением событий ---------- */
-function makeClient(label, onEvent) {
-  const ws = new WebSocket('ws://127.0.0.1:' + PORT + '/ws');
+function makeClient(label, onEvent, url) {
+  const ws = new WebSocket(url || ('ws://127.0.0.1:' + PORT + '/ws'));
   const c = { ws, events: [], label };
   ws.on('error', (e) => fail(label + ' ws error: ' + e.message));
   ws.on('message', (data) => {
@@ -171,6 +172,34 @@ async function main() {
   pass('C: attach к удалённой сессии даёт внятную ошибку');
 
   b.close();
+
+  /* ---------- D) preferred session: после сна/перегрузки остаёмся на своей сессии ---------- */
+  // на моменте: в системе одна сессия (s1). Клиент создаёт вторую (s2),
+  // новый клиент с ?session=s2 должен сразу попасть в s2, а не в первую
+  const d = makeClient('D');
+  await d.waitFor(o => o.type === 'bridge_hello', 'hello D');
+  const s1id = helloActive(d);
+  d.send(JSON.stringify({ type: 'bridge_create_session' }));
+  await d.waitFor(o => o.type === 'bridge_sessions' && o.sessions.length === 2, '2 сессии');
+  const s2id = d.events.filter(o => o.type === 'bridge_sessions').pop().sessions.map(s => s.id).find(id => id !== s1id);
+  const helloD = await d.waitFor(o => o.type === 'bridge_hello' && o.active === s2id, 'attach D к s2');
+  assert.strictEqual(helloD.active, s2id, 'D в s2');
+  pass('D: новая сессия создана (s2)');
+
+  const d2 = makeClient('D2', null, 'ws://127.0.0.1:' + PORT + '/ws?session=' + s2id);
+  const helloD2 = await d2.waitFor(o => o.type === 'bridge_hello', 'hello D2');
+  assert.strictEqual(helloD2.active, s2id, '?session= — сразу привязка к своей сессии');
+  pass('D: reconnect с ?session=s2 → привязка сразу к s2, не к первой');
+
+  // устаревший ?session= (удалили сессию) — фолбэк на первую без падения
+  d2.send(JSON.stringify({ type: 'bridge_delete_session', session: s2id }));
+  await d2.waitFor(o => o.type === 'bridge_sessions' && o.sessions.length === 1, 'после delete s2');
+  const d3 = makeClient('D3', null, 'ws://127.0.0.1:' + PORT + '/ws?session=' + s2id);
+  const helloD3 = await d3.waitFor(o => o.type === 'bridge_hello', 'hello D3');
+  assert.strictEqual(helloD3.active, s1id, 'удалённая сессия из ?session= → фолбэк на первую');
+  pass('D: ?session= на удалённую сессию → фолбэк на первую (без ошибки)');
+
+  d.close(); d2.close(); d3.close();
   clearTimeout(master);
   console.log('SMOKE OK');
   cleanup(0);

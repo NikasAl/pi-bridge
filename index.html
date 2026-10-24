@@ -149,6 +149,11 @@ let curText = null;             // текущий ассистентский т�
 let curThink = null;            // текущий thinking-блок (details)
 let sessions = [];              // [{id,name,alive,streaming}]
 let activeId = null;            // текущая привязанная сессия
+// помним активную сессию пережив (пере)загрузку/сон: после гашения экрана телефона
+// новое WS-соединение иначе упало бы в первую сессию (серверный авто-attach)
+const LS_ACTIVE = 'piBridgeActiveSession';
+function saveActive(id){ try { localStorage.setItem(LS_ACTIVE, String(id)); } catch {} }
+function loadActive(){ try { return localStorage.getItem(LS_ACTIVE); } catch { return null; } }
 const statusState = { model: null, think: null, ctx: null, streaming: false, piUp: null };
 const toolLines = new Map();    // toolCallId -> элемент строки инструмента
 
@@ -448,6 +453,7 @@ function handleBridge(o){
     case 'bridge_hello':
       sessions = o.sessions || [];
       activeId = o.active;
+      saveActive(o.active);
       statusState.piUp = !!o.piRunning;
       renderStatus(o.piRunning ? 'ok' : 'warn');
       renderSessions();
@@ -479,7 +485,9 @@ function connect(){
   const base = location.pathname.replace(/\/+$/, '');
   renderStatus('warn');
   modelEl.textContent = 'подключение…';
-  const sock = new WebSocket(proto + '://' + location.host + base + '/ws');
+  const saved = loadActive();
+  const sock = new WebSocket(proto + '://' + location.host + base + '/ws' +
+    (saved ? '?session=' + encodeURIComponent(saved) : ''));
   ws = sock;
   sock.onopen = () => { retryMs = 1000; };
   sock.onmessage = (ev) => {
