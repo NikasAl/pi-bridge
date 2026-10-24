@@ -7,6 +7,7 @@
 'use strict';
 
 let streaming = false;
+let sessionName = null;
 
 function emit(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
 function respond(id, command, success, data, error) {
@@ -53,10 +54,23 @@ process.stdin.on('data', (c) => {
       case 'get_state':
         respond(cmd.id, 'get_state', true, {
           model: { id: 'fake-model', name: 'Fake Model' },
-          thinkingLevel: 'off', isStreaming: streaming, isCompacting: false,
-          sessionFile: '/tmp/fake-session.jsonl', sessionId: 'fake123',
+          thinkingLevel: 'medium', isStreaming: streaming, isCompacting: false,
+          sessionFile: '/tmp/fake-session-' + process.pid + '.jsonl', sessionId: 'fake123',
+          sessionName: sessionName || undefined,
           messageCount: 2, pendingMessageCount: 0,
         });
+        break;
+      case 'get_session_stats':
+        respond(cmd.id, 'get_session_stats', true, {
+          sessionFile: '/tmp/fake-session.jsonl', sessionId: 'fake123',
+          tokens: { input: 50000, output: 10000, cacheRead: 40000, cacheWrite: 5000, total: 105000 },
+          cost: 0.45,
+          contextUsage: { tokens: 60000, contextWindow: 200000, percent: 30 },
+        });
+        break;
+      case 'set_session_name':
+        sessionName = String(cmd.name || '').slice(0, 80);
+        respond(cmd.id, 'set_session_name', true);
         break;
       case 'get_messages':
         respond(cmd.id, 'get_messages', true, { messages: [

@@ -28,7 +28,7 @@
   #model{color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
   header button{
     background:none;border:1px solid var(--line);color:var(--dim);border-radius:8px;
-    padding:4px 10px;font-size:12px;
+    padding:4px 10px;font-size:12px;flex:none;
   }
   #log{flex:1;overflow-y:auto;padding:10px 12px 16px;-webkit-overflow-scrolling:touch}
   .row{margin:6px 0;word-wrap:break-word;white-space:pre-wrap;overflow-wrap:anywhere}
@@ -43,6 +43,19 @@
   .sys.err{color:var(--err)}
   details.raw{color:var(--dim);font-size:11.5px;font-family:var(--mono)}
   details.raw summary{cursor:pointer}
+  /* markdown-рендер завершённых сообщений ассистента */
+  .md{white-space:normal}
+  .md p{margin:.4em 0}
+  .md h1,.md h2,.md h3,.md h4{margin:.55em 0 .3em;line-height:1.3}
+  .md h1{font-size:1.25em}.md h2{font-size:1.15em}.md h3{font-size:1.05em}.md h4{font-size:1em}
+  .md ul,.md ol{margin:.4em 0;padding-left:1.4em}
+  .md li{margin:.15em 0}
+  .md code{font-family:var(--mono);font-size:.9em;background:#1d2230;border-radius:4px;padding:1px 5px}
+  .md pre{background:#1d2230;border:1px solid var(--line);border-radius:8px;padding:8px 10px;overflow-x:auto;margin:.5em 0}
+  .md pre code{background:none;padding:0;white-space:pre}
+  .md blockquote{border-left:3px solid var(--line);margin:.4em 0;padding:2px 10px;color:var(--dim)}
+  .md a{color:var(--accent)}
+  .md hr{border:none;border-top:1px solid var(--line);margin:.8em 0}
   #jump{
     position:absolute;right:14px;bottom:86px;display:none;
     border:1px solid var(--line);background:var(--panel);color:var(--text);
@@ -70,14 +83,40 @@
     flex:none;border:none;border-radius:12px;background:var(--accent);color:#fff;
     padding:10px 16px;font:inherit;font-weight:600;
   }
+  /* панель сессий */
+  #drawer{
+    display:none;position:fixed;z-index:10;left:0;right:0;top:0;
+    max-height:75%;overflow-y:auto;background:var(--panel);
+    border-bottom:2px solid var(--line);padding:10px 12px;
+    padding-top:calc(10px + env(safe-area-inset-top));
+  }
+  #drawer.open{display:block}
+  .dhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+  .dhead button{background:none;border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:4px 10px;font-size:12px}
+  .srow{display:flex;gap:6px;align-items:center;padding:8px 2px;border-bottom:1px solid var(--line)}
+  .sname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+  .sname.cur{color:var(--accent);font-weight:600}
+  .srun{color:var(--warn);font-size:11px;flex:none}
+  .srow button{
+    background:none;border:1px solid var(--line);color:var(--dim);border-radius:8px;
+    padding:3px 8px;font-size:11px;flex:none;
+  }
+  .srow button.danger{border-color:var(--err);color:var(--err)}
+  #dnew{margin-top:10px;width:100%;background:none;border:1px dashed var(--line);color:var(--text);border-radius:8px;padding:8px;font-size:13px}
 </style>
 </head>
 <body>
 <header>
   <div id="dot"></div>
   <div id="model">подключение…</div>
-  <button id="new">новая сессия</button>
+  <button id="tabs">сессии</button>
 </header>
+
+<div id="drawer">
+  <div class="dhead"><b>Сессии</b><button id="dclose">закрыть</button></div>
+  <div id="slist"></div>
+  <button id="dnew">+ новая сессия</button>
+</div>
 
 <div id="log"></div>
 <button id="jump">вниз</button>
@@ -95,19 +134,22 @@
   </div>
 </div>
 
+<script src="md.js"></script>
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
 const logEl = $('log'), dot = $('dot'), modelEl = $('model'), inEl = $('in');
 
-let ws = null, retryMs = 1000, closedByUs = false;
+let ws = null, retryMs = 1000, reconnectTimer = null;
 let streaming = false;          // агент работает
 let mode = 'steer';             // steer | follow_up — куда уйдёт сообщение во время стриминга
 let stick = true;               // прилеплены ли к низу лога
 let lastSent = '';              // для дедупликации эха user-сообщений
-let historyDone = false;        // история от get_messages отрисована
 let curText = null;             // текущий ассистентский текстовый блок
 let curThink = null;            // текущий thinking-блок (details)
+let sessions = [];              // [{id,name,alive,streaming}]
+let activeId = null;            // текущая привязанная сессия
+const statusState = { model: null, think: null, ctx: null, streaming: false, piUp: null };
 const toolLines = new Map();    // toolCallId -> элемент строки инструмента
 
 /* ---------- утилиты DOM ---------- */
@@ -123,6 +165,38 @@ function rawDetails(label, obj){
   return det;
 }
 function short(s, n){ s = String(s); return s.length > n ? s.slice(0, n) + '…' : s; }
+function fmtK(n){ return n >= 1000 ? Math.round(n / 1000) + 'k' : String(n); }
+function wsSend(obj){
+  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+  else sysLine('нет соединения', true);
+}
+
+/* ---------- строка статуса: модель · контекст · мышление ---------- */
+function renderStatus(cls){
+  let d = cls;
+  if (!d) d = statusState.piUp === false ? 'warn' : (ws && ws.readyState === ws.OPEN ? 'ok' : 'err');
+  dot.className = d;
+  const parts = [];
+  if (statusState.model) parts.push(statusState.model);
+  if (statusState.ctx) parts.push('ctx ' + statusState.ctx);
+  if (statusState.think && statusState.think !== 'off') parts.push('мысли ' + statusState.think);
+  if (statusState.streaming) parts.push('работает');
+  modelEl.textContent = parts.length ? parts.join(' · ') : 'подключение…';
+}
+function applyState(o){
+  if (o.model) statusState.model = o.model.name || o.model.id;
+  if ('thinkingLevel' in o) statusState.think = o.thinkingLevel;
+  if ('isStreaming' in o) statusState.streaming = !!o.isStreaming;
+  renderStatus('ok');
+}
+function applyStats(d){
+  const cu = d && d.contextUsage;
+  if (cu && cu.contextWindow){
+    statusState.ctx = (cu.percent != null ? Math.round(cu.percent) + '%' : fmtK(cu.tokens)) +
+      ' (' + fmtK(cu.tokens) + '/' + fmtK(cu.contextWindow) + ')';
+  } else statusState.ctx = null;
+  renderStatus();
+}
 
 /* ---------- рендер лога ---------- */
 function userBubble(text){ add(div('row user', text)); }
@@ -143,9 +217,15 @@ function ensureThink(){
 }
 function closeStreams(){ curText = null; curThink = null; }
 
+/* маркдаун — только для завершённых сообщений ассистента (во время стриминга — plain text) */
+function mdBlock(text){
+  const d = div('row assistant md');
+  d.innerHTML = window.piMd.render(text); // piMd экранирует HTML сам
+  return d;
+}
+
 function toolLineStart(id, name, args){
   const d = div('tool');
-  d.innerHTML = ''; // безопасность: собираем узлами
   const b = document.createElement('b'); b.textContent = name || 'tool'; d.appendChild(b);
   const st = document.createElement('span'); st.className = 'st'; st.textContent = ' …'; d.appendChild(st);
   const pre = document.createElement('div'); pre.textContent = args ? short(JSON.stringify(args), 300) : '';
@@ -170,12 +250,20 @@ function toolLineEnd(id, isError, resultText){
   toolLines.delete(id);
 }
 
-function renderHistory(messages){
-  if (!Array.isArray(messages)) return;
-  for (const m of messages){
-    try { renderHistoryMessage(m); } catch (e) { add(rawDetails('сообщение (не разобрано)', m)); }
+/* полная пересборка лога из истории — устраняет и дубли, и пропуски после обрыва */
+function rebuildLog(messages){
+  logEl.textContent = '';
+  toolLines.clear();
+  closeStreams();
+  lastSent = '';
+  stick = true;
+  if (Array.isArray(messages)){
+    for (const m of messages){
+      try { renderHistoryMessage(m); } catch (e) { add(rawDetails('сообщение (не разобрано)', m)); }
+    }
+    sysLine('— история сессии (' + messages.length + ' сообщений) —');
   }
-  sysLine('— история сессии (' + messages.length + ' сообщений) —');
+  scrollBottom();
 }
 function contentText(c){
   if (typeof c === 'string') return c;
@@ -191,13 +279,13 @@ function renderHistoryMessage(m){
     if (Array.isArray(content)){
       for (const b of content){
         if (!b || typeof b !== 'object') continue;
-        if (b.type === 'text' && b.text) add(div('row assistant', b.text));
+        if (b.type === 'text' && b.text) add(mdBlock(b.text));
         else if (b.type === 'thinking' && b.thinking) add(div('row thinking', short(b.thinking, 800)));
         else if (/toolcall|tool_call|toolCall/.test(b.type || '')){
           toolLineStart(null, b.name || b.toolName || 'tool', b.arguments || b.args || null);
         } else add(rawDetails('блок ' + (b.type || '?'), b));
       }
-    } else if (contentText(content)) add(div('row assistant', contentText(content)));
+    } else if (contentText(content)) add(mdBlock(contentText(content)));
     return;
   }
   if (/tool/i.test(role || '')){
@@ -209,36 +297,30 @@ function renderHistoryMessage(m){
 }
 
 /* ---------- обработка событий pi ---------- */
-function setStatus(cls, text){ dot.className = cls; modelEl.textContent = text; }
 function setStreaming(v){
   streaming = v;
+  statusState.streaming = v;
   $('ctrl').classList.toggle('on', v);
   $('mode').textContent = mode === 'steer' ? 'steer' : 'follow-up';
   $('mode').className = mode === 'steer' ? 'steer' : 'follow';
+  renderStatus();
 }
 
 function handleEvent(o){
   switch (o.type){
     case 'response': {
       if (o.command === 'get_state'){
-        if (o.success){
-          const m = o.data && o.data.model;
-          const name = m ? (m.name || m.id) : 'модель не выбрана';
-          setStatus('ok', 'pi · ' + name + (o.data && o.data.isStreaming ? ' · работает' : ''));
-          setStreaming(!!(o.data && o.data.isStreaming));
-        }
+        if (o.success){ applyState(o.data || {}); setStreaming(!!(o.data && o.data.isStreaming)); }
+        break;
+      }
+      if (o.command === 'get_session_stats'){
+        if (o.success) applyStats(o.data || {});
         break;
       }
       if (o.command === 'get_messages'){
-        if (o.success && !historyDone){
-          historyDone = true;
-          renderHistory(o.data && o.data.messages);
-        }
-        break;
-      }
-      if (o.command === 'new_session' && o.success){
-        logEl.textContent = ''; toolLines.clear(); closeStreams();
-        sysLine('— начата новая сессия —');
+        // пересобираем лог на КАЖДОЕ получение истории (и на первом входе, и после ресинка):
+        // нет дублей и нет пропусков событий, случившихся во время обрыва
+        if (o.success) rebuildLog(o.data && o.data.messages);
         break;
       }
       if (o.command === 'prompt' || o.command === 'steer' || o.command === 'follow_up'){
@@ -265,7 +347,16 @@ function handleEvent(o){
       switch (e.type){
         case 'text_start': curThink = null; curText = null; ensureText(); break;
         case 'text_delta': ensureText().textContent += e.delta || ''; break;
-        case 'text_end': curText = null; break;
+        case 'text_end': {
+          const el = curText;
+          if (el){
+            const full = e.content != null ? e.content : el.textContent;
+            el.innerHTML = window.piMd.render(full);
+            el.classList.add('md');
+          }
+          curText = null;
+          break;
+        }
         case 'thinking_start': curText = null; ensureThink(); break;
         case 'thinking_delta': ensureThink().textContent += e.delta || ''; break;
         case 'thinking_end': curThink = null; break;
@@ -274,7 +365,7 @@ function handleEvent(o){
         case 'toolcall_end': {
           const tc = e.toolCall || {};
           const d = e.id && toolLines.get(e.id);
-          if (d && !d._argsShown){
+          if (d){
             const pre = d.children[2];
             pre.textContent = short(JSON.stringify(tc.arguments || tc.args || tc), 300);
           }
@@ -299,7 +390,12 @@ function handleEvent(o){
     }
     case 'agent_start': setStreaming(true); break;
     case 'agent_end': if (o.willRetry) sysLine('агент завершит попытку и повторит…'); break;
-    case 'agent_settled': setStreaming(false); break;
+    case 'agent_settled':
+      setStreaming(false);
+      // обновить контекст/мышление после завершения хода
+      wsSend({ type: 'get_state' });
+      wsSend({ type: 'get_session_stats' });
+      break;
     case 'queue_update': {
       const s = (o.steering || []).length, f = (o.followUp || []).length;
       $('qinfo').textContent = (s || f) ? ('в очереди: ' + (s ? s + ' steer ' : '') + (f ? f + ' follow' : '')) : '';
@@ -307,7 +403,10 @@ function handleEvent(o){
     }
     case 'auto_retry_start': sysLine('auto-retry #' + o.attempt + ' через ' + o.delayMs + ' мс: ' + (o.errorMessage || ''), true); break;
     case 'compaction_start': sysLine('компакция контекста…'); break;
-    case 'compaction_end': sysLine('компакция завершена'); break;
+    case 'compaction_end':
+      sysLine('компакция завершена');
+      wsSend({ type: 'get_session_stats' });
+      break;
     case 'bash_execution_update': break; // живой вывод bash в лог не дублируем
     case 'extension_ui_request': add(rawDetails('запрос UI расширения (не поддержан)', o)); break;
     default:
@@ -315,17 +414,53 @@ function handleEvent(o){
   }
 }
 
-/* служебные события моста */
+/* ---------- панель сессий ---------- */
+function renderSessions(){
+  const list = $('slist');
+  list.textContent = '';
+  for (const s of sessions){
+    const row = div('srow');
+    if (s.streaming){ const b = document.createElement('span'); b.className = 'srun'; b.textContent = 'работает'; row.appendChild(b); }
+    const nm = div('sname' + (s.id === activeId ? ' cur' : ''), s.name);
+    nm.onclick = () => { wsSend({ type: 'bridge_attach', session: s.id }); toggleDrawer(false); };
+    row.appendChild(nm);
+    const ren = document.createElement('button'); ren.textContent = 'переим.';
+    ren.onclick = () => {
+      const n = prompt('Новое имя сессии:', s.name);
+      if (n && n.trim()) wsSend({ type: 'bridge_rename_session', session: s.id, name: n.trim() });
+    };
+    const del = document.createElement('button'); del.textContent = 'удалить'; del.className = 'danger';
+    del.onclick = () => {
+      if (confirm('Удалить сессию «' + s.name + '»? Процесс будет остановлен, файл сессии удалён с диска.')){
+        wsSend({ type: 'bridge_delete_session', session: s.id });
+        toggleDrawer(false);
+      }
+    };
+    row.appendChild(ren); row.appendChild(del);
+    list.appendChild(row);
+  }
+}
+function toggleDrawer(v){ $('drawer').classList.toggle('open', v); }
+
+/* ---------- события моста ---------- */
 function handleBridge(o){
   switch (o.type){
     case 'bridge_hello':
-      setStatus(o.piRunning ? 'ok' : 'warn', o.piRunning ? 'pi запущен' : 'pi не запущен');
-      sysLine('мост: ' + o.cmd + ' · cwd: ' + o.cwd);
+      sessions = o.sessions || [];
+      activeId = o.active;
+      statusState.piUp = !!o.piRunning;
+      renderStatus(o.piRunning ? 'ok' : 'warn');
+      renderSessions();
+      wsSend({ type: 'get_session_stats' });
+      break;
+    case 'bridge_sessions':
+      sessions = o.sessions || [];
+      renderSessions();
       break;
     case 'bridge_status':
-      if (o.status === 'pi_up') setStatus('ok', 'pi запущен');
-      else if (o.status === 'pi_down'){ setStatus('warn', 'pi упал, перезапуск…'); setStreaming(false); sysLine('процесс pi завершился (code=' + o.code + ')'); }
-      else if (o.status === 'pi_error'){ setStatus('err', 'ошибка pi'); sysLine('pi: ' + o.error, true); }
+      if (o.status === 'pi_up'){ statusState.piUp = true; renderStatus('ok'); }
+      else if (o.status === 'pi_down'){ statusState.piUp = false; renderStatus('warn'); setStreaming(false); sysLine('процесс pi завершился (code=' + o.code + '), перезапуск…'); }
+      else if (o.status === 'pi_error'){ statusState.piUp = false; renderStatus('err'); sysLine('pi: ' + o.error, true); }
       break;
     case 'bridge_stderr': sysLine('pi stderr: ' + short(o.line, 500), true); break;
     case 'bridge_raw': sysLine('pi stdout (не JSON): ' + short(o.line, 500)); break;
@@ -335,26 +470,35 @@ function handleBridge(o){
 
 /* ---------- WebSocket ---------- */
 function connect(){
+  // Идемпотентность: если живое соединение уже есть/устанавливается — не создаём второе.
+  // Именно отсутствие этой проверки вызывало задвоение сообщений после сна телефона:
+  // таймер ретрая и visibilitychange создавали параллельные сокеты.
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer = null; }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const base = location.pathname.replace(/\/+$/, '');
-  setStatus('warn', 'подключение…');
-  ws = new WebSocket(proto + '://' + location.host + base + '/ws');
-  ws.onopen = () => { retryMs = 1000; sysLine('— соединение установлено —'); };
-  ws.onmessage = (ev) => {
+  renderStatus('warn');
+  modelEl.textContent = 'подключение…';
+  const sock = new WebSocket(proto + '://' + location.host + base + '/ws');
+  ws = sock;
+  sock.onopen = () => { retryMs = 1000; };
+  sock.onmessage = (ev) => {
+    if (ev.target !== ws){ try { ev.target.close(); } catch {} return; } // игнор устаревших сокетов
     let o; try { o = JSON.parse(ev.data); } catch { return; }
     if (/^bridge_/.test(o.type || '')) handleBridge(o); else handleEvent(o);
   };
-  ws.onclose = () => {
-    if (closedByUs) return;
-    setStatus('err', 'нет связи');
+  sock.onclose = () => {
+    if (ws !== sock) return; // закрылся устаревший сокет — ретраи не нужны
+    statusState.piUp = null;
+    renderStatus('err');
     setStreaming(false);
-    setTimeout(connect, retryMs);
+    reconnectTimer = setTimeout(connect, retryMs);
     retryMs = Math.min(retryMs * 1.7, 10000);
   };
-  ws.onerror = () => { try { ws.close(); } catch {} };
+  sock.onerror = () => { try { sock.close(); } catch {} };
 }
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && (!ws || ws.readyState === ws.CLOSED)) connect();
+  if (!document.hidden) connect(); // connect() сам проверит, не открыто ли уже
 });
 
 /* ---------- отправка ---------- */
@@ -365,7 +509,7 @@ function send(){
   const msg = streaming
     ? { id: 'c' + Date.now(), type: mode, message: text }
     : { id: 'c' + Date.now(), type: 'prompt', message: text };
-  ws.send(JSON.stringify(msg));
+  wsSend(msg);
   lastSent = text;
   userBubble(text + (streaming ? (mode === 'steer' ? '  [steer]' : '  [follow-up]') : ''));
   inEl.value = ''; inEl.style.height = 'auto';
@@ -375,12 +519,11 @@ inEl.addEventListener('input', () => { inEl.style.height = 'auto'; inEl.style.he
 inEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)){ e.preventDefault(); send(); }
 });
-$('abort').onclick = () => { if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'abort' })); };
+$('abort').onclick = () => wsSend({ type: 'abort' });
 $('mode').onclick = () => { mode = mode === 'steer' ? 'follow_up' : 'steer'; setStreaming(streaming); };
-$('new').onclick = () => {
-  if (!confirm('Начать новую сессию? Текущая сохранится в файле сессий pi.')) return;
-  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'new_session' }));
-};
+$('tabs').onclick = () => toggleDrawer(!$('drawer').classList.contains('open'));
+$('dclose').onclick = () => toggleDrawer(false);
+$('dnew').onclick = () => { wsSend({ type: 'bridge_create_session' }); toggleDrawer(false); };
 $('jump').onclick = () => { stick = true; scrollBottom(); };
 logEl.addEventListener('scroll', () => {
   const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 90;
