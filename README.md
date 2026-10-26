@@ -81,7 +81,7 @@ systemctl --user enable --now pi-bridge
 loginctl enable-linger $USER   # работать и без активного логина
 ```
 
-## nginx (VPS kreagenium.ru)
+## nginx (VPS <your-domain.example>)
 
 Файл паролей (если ещё нет):
 
@@ -117,7 +117,7 @@ location /piweb/ {
 
 ## Проверка с телефона
 
-1. `https://kreagenium.ru/piweb/` → окно basic auth (логин/пароль из htpasswd).
+1. `https://<your-domain.example>/piweb/` → окно basic auth (логин/пароль из htpasswd).
 2. Статусная строка: зелёная точка, модель, `ctx 30% (60k/200k)` (контекст из
    `get_session_stats`), `мысли medium` (уровень размышлений из `get_state`).
 3. Подгружается история сессии (`get_messages`); после обрыва связи лог
