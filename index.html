@@ -19,12 +19,13 @@
     display:flex; flex-direction:column;
   }
   header{
-    display:flex; align-items:center; gap:8px; padding:8px 12px;
+    display:flex; align-items:center; padding:8px 12px;
     background:var(--panel); border-bottom:1px solid var(--line);
     padding-top:calc(8px + env(safe-area-inset-top));
   }
   #dot{width:10px;height:10px;border-radius:50%;background:var(--err);flex:none}
   #dot.ok{background:var(--ok)} #dot.warn{background:var(--warn)}
+  header > * + *{margin-left:8px}
   #model{color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
   header button{
     background:none;border:1px solid var(--line);color:var(--dim);border-radius:8px;
@@ -65,14 +66,16 @@
     border-top:1px solid var(--line);background:var(--panel);
     padding:8px 10px calc(8px + env(safe-area-inset-bottom));
   }
-  #ctrl{display:none;align-items:center;gap:8px;margin-bottom:6px;font-size:12px;color:var(--dim)}
+  #ctrl{display:none;align-items:center;margin-bottom:6px;font-size:12px;color:var(--dim)}
   #ctrl.on{display:flex}
+  #ctrl > * + *{margin-left:8px}
   #runbadge{color:var(--warn)}
   #qinfo{flex:1}
   #ctrl button{border:1px solid var(--line);background:none;color:var(--text);border-radius:8px;padding:4px 10px;font-size:12px}
   #ctrl button.stop{border-color:var(--err);color:var(--err)}
   #mode.steer{color:var(--accent)} #mode.follow{color:var(--ok)}
-  #inrow{display:flex;gap:8px;align-items:flex-end}
+  #inrow{display:flex;align-items:flex-end}
+  #inrow > * + *{margin-left:8px}
   textarea{
     flex:1;resize:none;background:var(--bg);color:var(--text);
     border:1px solid var(--line);border-radius:12px;padding:9px 12px;
@@ -92,8 +95,11 @@
   }
   #drawer.open{display:block}
   .dhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+  /* <details> без нативной поддержки (старые iOS): раскрывание через .xopen */
+  details:not([open]):not(.xopen) > *:not(summary){display:none}
   .dhead button{background:none;border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:4px 10px;font-size:12px}
-  .srow{display:flex;gap:6px;align-items:center;padding:8px 2px;border-bottom:1px solid var(--line)}
+  .srow{display:flex;align-items:center;padding:8px 2px;border-bottom:1px solid var(--line)}
+  .srow > * + *{margin-left:6px}
   .sname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
   .sname.cur{color:var(--accent);font-weight:600}
   .srun{color:var(--warn);font-size:11px;flex:none}
@@ -136,6 +142,18 @@
 
 <script src="md.js"></script>
 <script>
+// полифилл <details>/<summary> для Safari < 12.1 (стара iOS): кликом по summary
+// тумбулится класс .xopen, CSS скрывает/показывает содержимое
+(function(){
+  if (typeof HTMLDetailsElement !== 'undefined') return;
+  document.addEventListener('click', function(e){
+    var t = e.target;
+    while (t && t.tagName !== 'SUMMARY') t = t.parentNode;
+    if (t && t.parentNode) t.parentNode.classList.toggle('xopen');
+  });
+})();
+</script>
+<script>
 'use strict';
 const $ = id => document.getElementById(id);
 const logEl = $('log'), dot = $('dot'), modelEl = $('model'), inEl = $('in');
@@ -152,8 +170,8 @@ let activeId = null;            // текущая привязанная сес�
 // помним активную сессию пережив (пере)загрузку/сон: после гашения экрана телефона
 // новое WS-соединение иначе упало бы в первую сессию (серверный авто-attach)
 const LS_ACTIVE = 'piBridgeActiveSession';
-function saveActive(id){ try { localStorage.setItem(LS_ACTIVE, String(id)); } catch {} }
-function loadActive(){ try { return localStorage.getItem(LS_ACTIVE); } catch { return null; } }
+function saveActive(id){ try { localStorage.setItem(LS_ACTIVE, String(id)); } catch (e) {} }
+function loadActive(){ try { return localStorage.getItem(LS_ACTIVE); } catch (e) { return null; } }
 const statusState = { model: null, think: null, ctx: null, streaming: false, piUp: null };
 const toolLines = new Map();    // toolCallId -> элемент строки инструмента
 
@@ -491,8 +509,8 @@ function connect(){
   ws = sock;
   sock.onopen = () => { retryMs = 1000; };
   sock.onmessage = (ev) => {
-    if (ev.target !== ws){ try { ev.target.close(); } catch {} return; } // игнор устаревших сокетов
-    let o; try { o = JSON.parse(ev.data); } catch { return; }
+    if (ev.target !== ws){ try { ev.target.close(); } catch (e) {} return; } // игнор устаревших сокетов
+    let o; try { o = JSON.parse(ev.data); } catch (e) { return; }
     if (/^bridge_/.test(o.type || '')) handleBridge(o); else handleEvent(o);
   };
   sock.onclose = () => {
@@ -503,7 +521,7 @@ function connect(){
     reconnectTimer = setTimeout(connect, retryMs);
     retryMs = Math.min(retryMs * 1.7, 10000);
   };
-  sock.onerror = () => { try { sock.close(); } catch {} };
+  sock.onerror = () => { try { sock.close(); } catch (e) {} };
 }
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) connect(); // connect() сам проверит, не открыто ли уже
