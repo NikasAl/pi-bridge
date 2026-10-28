@@ -83,8 +83,8 @@
   }
   textarea:focus{border-color:var(--accent)}
   #send{
-    flex:none;border:none;border-radius:12px;background:var(--accent);color:#fff;
-    padding:10px 16px;font:inherit;font-weight:600;
+    flex:none;border:none;border-radius:50%;background:var(--accent);color:#fff;
+    width:42px;height:42px;display:flex;align-items:center;justify-content:center;
   }
   /* панель сессий */
   #drawer{
@@ -136,7 +136,9 @@
   </div>
   <div id="inrow">
     <textarea id="in" rows="1" placeholder="Сообщение…"></textarea>
-    <button id="send">Отправить</button>
+    <button id="send" title="Отправить" aria-label="Отправить">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M2 21l21-9L2 3v7l15 2-15 2v7z"/></svg>
+    </button>
   </div>
 </div>
 
