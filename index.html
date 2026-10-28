@@ -86,6 +86,27 @@
     flex:none;border:none;border-radius:50%;background:var(--accent);color:#fff;
     width:42px;height:42px;display:flex;align-items:center;justify-content:center;
   }
+  #attach{
+    flex:none;border:1px solid var(--line);background:none;color:var(--dim);
+    border-radius:50%;width:42px;height:42px;
+    display:flex;align-items:center;justify-content:center;
+  }
+  #attach.off{opacity:.35}
+  /* чипы выбранных вложений и превью в бабле пользователя:
+     инлайн-блоки + марджины вместо flex-gap (iOS-совместимость) */
+  #attachbar{display:none}
+  #attachbar.on{display:flex;flex-wrap:wrap}
+  #attachbar > *{margin:0 6px 6px 0}
+  .chip{position:relative}
+  .chip img{width:46px;height:46px;object-fit:cover;border-radius:8px;border:1px solid var(--line);display:block}
+  .chip button{
+    position:absolute;top:-7px;right:-7px;border:1px solid var(--line);background:var(--panel);
+    color:var(--dim);border-radius:50%;width:20px;height:20px;font-size:11px;line-height:1;padding:0;
+  }
+  .uimgs{margin-top:6px}
+  .uimgs > *{margin:0 6px 6px 0;display:inline-block;vertical-align:top}
+  .uimgs img{max-width:150px;max-height:110px;border-radius:8px;display:block}
+  .imgstub{border:1px dashed var(--line);border-radius:8px;padding:3px 8px;font-size:12px;color:var(--dim)}
   /* панель сессий */
   #drawer{
     display:none;position:fixed;z-index:10;left:0;right:0;top:0;
@@ -128,6 +149,7 @@
 <button id="jump">вниз</button>
 
 <div id="bar">
+  <div id="attachbar"></div>
   <div id="ctrl">
     <span id="runbadge">агент работает</span>
     <span id="qinfo"></span>
@@ -135,11 +157,15 @@
     <button id="abort" class="stop">стоп</button>
   </div>
   <div id="inrow">
+    <button id="attach" title="Прикрепить фото" aria-label="Прикрепить фото">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+    </button>
     <textarea id="in" rows="1" placeholder="Сообщение…"></textarea>
     <button id="send" title="Отправить" aria-label="Отправить">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M2 21l21-9L2 3v7l15 2-15 2v7z"/></svg>
     </button>
   </div>
+  <input type="file" id="file" accept="image/*" multiple hidden>
 </div>
 
 <script src="md.js"></script>
@@ -209,7 +235,11 @@ function renderStatus(cls){
   modelEl.textContent = parts.length ? parts.join(' · ') : 'подключение…';
 }
 function applyState(o){
-  if (o.model) statusState.model = o.model.name || o.model.id;
+  if (o.model){
+    statusState.model = o.model.name || o.model.id;
+    // модели без vision — кнопку прикрепа гасим заранее (model.input из get_state)
+    setAttachEnabled(!Array.isArray(o.model.input) || o.model.input.indexOf('image') >= 0);
+  }
   if ('thinkingLevel' in o) statusState.think = o.thinkingLevel;
   if ('isStreaming' in o) statusState.streaming = !!o.isStreaming;
   renderStatus('ok');
@@ -224,7 +254,26 @@ function applyStats(d){
 }
 
 /* ---------- рендер лога ---------- */
-function userBubble(text){ add(div('row user', text)); }
+function userBubble(text, imgs){
+  const d = div('row user', '');
+  if (text) d.textContent = text;
+  const list = imgs || [];
+  if (!text && !list.length) d.textContent = '[пусто]';
+  if (list.length){
+    const row = document.createElement('div'); row.className = 'uimgs';
+    for (const a of list){
+      if (a.url){ const im = document.createElement('img'); im.src = a.url; im.alt = 'фото'; row.appendChild(im); }
+      else { const sp = document.createElement('span'); sp.className = 'imgstub'; sp.textContent = '🖼 ' + (a.mime || 'image'); row.appendChild(sp); }
+    }
+    d.appendChild(row);
+  }
+  add(d);
+  return d;
+}
+
+function imageBlocks(content){
+  return Array.isArray(content) ? content.filter(b => b && b.type === 'image') : [];
+}
 
 function ensureText(){
   if (!curText){ curText = div('row assistant', ''); add(curText); }
@@ -299,7 +348,7 @@ function contentText(c){
 function renderHistoryMessage(m){
   const role = m.role || (m.message && m.message.role);
   const content = m.content != null ? m.content : (m.message && m.message.content);
-  if (role === 'user'){ userBubble(contentText(content) || '[пусто]'); return; }
+  if (role === 'user'){ userBubble(contentText(content) || '', imageBlocks(content)); return; }
   if (role === 'assistant'){
     if (Array.isArray(content)){
       for (const b of content){
@@ -362,7 +411,7 @@ function handleEvent(o){
       if (m.role === 'user'){
         const t = contentText(m.content);
         if (t && t === lastSent) break;      // свой локальный эхо уже показан
-        userBubble(t || '[пусто]');
+        userBubble(t || '', imageBlocks(m.content));
       }
       break;
     }
@@ -530,16 +579,88 @@ document.addEventListener('visibilitychange', () => {
 });
 
 /* ---------- отправка ---------- */
+
+/* ---------- вложения-картинки (нативные images в prompt/steer/follow_up) ---------- */
+let pending = [];               // {data (base64), mime, url (objectURL превью), name}
+const MAX_IMGS = 10;            // у моделей pi лимит ~20 картинок на сообщение
+const LONG_SIDE = 1024;         // ресайз на клиенте — экономия трафика и токенов
+
+function setAttachEnabled(on){
+  const b = $('attach');
+  b.classList.toggle('off', !on);
+  b.disabled = !on;
+}
+function renderAttachBar(){
+  const bar = $('attachbar');
+  bar.classList.toggle('on', pending.length > 0);
+  bar.textContent = '';
+  pending.forEach((a, i) => {
+    const chip = document.createElement('span'); chip.className = 'chip';
+    const img = document.createElement('img'); img.src = a.url; img.alt = a.name || 'фото';
+    const x = document.createElement('button'); x.textContent = '✕';
+    x.title = x.ariaLabel = 'Убрать вложение';
+    x.onclick = () => { URL.revokeObjectURL(a.url); pending.splice(i, 1); renderAttachBar(); };
+    chip.appendChild(img); chip.appendChild(x);
+    bar.appendChild(chip);
+  });
+}
+
+function shrinkImage(file){
+  return new Promise((resolve) => {
+    const done = (blob) => {
+      const r = new FileReader();
+      r.onload = () => {
+        const s = String(r.result);
+        resolve({ data: s.slice(s.indexOf(',') + 1), mime: blob.type, url: URL.createObjectURL(blob), name: file.name });
+      };
+      r.readAsDataURL(blob);
+    };
+    const srcUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(srcUrl);
+      const scale = Math.min(1, LONG_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
+      const w = Math.max(1, Math.round(img.naturalWidth * scale));
+      const h = Math.max(1, Math.round(img.naturalHeight * scale));
+      const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+      cv.getContext('2d').drawImage(img, 0, 0, w, h);
+      const asJpeg = () => cv.toBlob(b => done(b || file), 'image/jpeg', 0.85);
+      if (file.type === 'image/png'){
+        // PNG держим для скриншотов (текст не мылится), но «фото-тяжёлый» PNG жмём в JPEG
+        cv.toBlob(b => (b && b.size <= 1536 * 1024 ? done(b) : asJpeg()), 'image/png');
+      } else asJpeg();
+    };
+    img.onerror = () => { URL.revokeObjectURL(srcUrl); done(file); };
+    img.src = srcUrl;
+  });
+}
+
+$('attach').onclick = () => { if (!$('attach').disabled) $('file').click(); };
+$('file').addEventListener('change', async () => {
+  const files = [...($('file').files || [])];
+  $('file').value = '';
+  for (const f of files){
+    if (pending.length >= MAX_IMGS){ sysLine('не больше ' + MAX_IMGS + ' картинок на сообщение', true); break; }
+    if (!/^image\//.test(f.type)) continue;
+    pending.push(await shrinkImage(f));
+    renderAttachBar();
+  }
+});
+
 function send(){
   const text = inEl.value.trim();
-  if (!text) return;
+  if (!text && !pending.length) return;
   if (!ws || ws.readyState !== ws.OPEN){ sysLine('нет соединения', true); return; }
   const msg = streaming
-    ? { id: 'c' + Date.now(), type: mode, message: text }
-    : { id: 'c' + Date.now(), type: 'prompt', message: text };
+    ? { id: 'c' + Date.now(), type: mode, message: text || '📷' }
+    : { id: 'c' + Date.now(), type: 'prompt', message: text || '📷' };
+  if (pending.length) msg.images = pending.map(a => ({ type: 'image', data: a.data, mimeType: a.mime }));
   wsSend(msg);
-  lastSent = text;
-  userBubble(text + (streaming ? (mode === 'steer' ? '  [steer]' : '  [follow-up]') : ''));
+  lastSent = msg.message;
+  userBubble(text + (streaming ? (mode === 'steer' ? '  [steer]' : '  [follow-up]') : ''),
+    pending.map(a => ({ url: a.url })));
+  pending = [];                  // objectURL живут в бабле лога
+  renderAttachBar();
   inEl.value = ''; inEl.style.height = 'auto';
 }
 $('send').onclick = send;

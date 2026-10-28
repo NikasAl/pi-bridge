@@ -16,12 +16,18 @@ function respond(id, command, success, data, error) {
   emit(r);
 }
 
-function runPrompt(id, message) {
+function runPrompt(id, message, images) {
   streaming = true;
   emit({ type: 'agent_start' });
-  emit({ type: 'message_start', message: { role: 'user', content: message, timestamp: Date.now() } });
+  const userContent = images && images.length
+    ? [{ type: 'text', text: message }, ...images.map(i => ({ type: 'image', data: String(i.data || ''), mimeType: i.mimeType || 'image/png' }))]
+    : message;
+  emit({ type: 'message_start', message: { role: 'user', content: userContent, timestamp: Date.now() } });
+  const parts = images && images.length
+    ? ['Фото (' + images.length + '/' + (images[0].mimeType || '-') + '). ', '«' + message + '». ', 'Выполняю тестовый ответ.']
+    : ['Понял: ', '«' + message + '». ', 'Выполняю тестовый ответ.'];
   emit({ type: 'message_update', assistantMessageEvent: { type: 'text_start', contentIndex: 0 } });
-  for (const part of ['Понял: ', '«' + message + '». ', 'Выполняю тестовый ответ.']) {
+  for (const part of parts) {
     emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: part } });
   }
   emit({ type: 'message_update', assistantMessageEvent: { type: 'text_end', contentIndex: 0, content: 'ok' } });
@@ -79,6 +85,11 @@ process.stdin.on('data', (c) => {
             { type: 'thinking', thinking: 'старые размышления' },
             { type: 'text', text: 'Прошлый ответ ассистента из истории.' },
           ] },
+          // user-сообщение с картинкой — мост обязан вырезать base64 перед бродкастом
+          { role: 'user', content: [
+            { type: 'text', text: 'Смотри фото из истории' },
+            { type: 'image', data: 'HISTIMGBASE64DATA', mimeType: 'image/png' },
+          ] },
         ] });
         break;
       case 'prompt':
@@ -87,7 +98,7 @@ process.stdin.on('data', (c) => {
         } else if (cmd.streamingBehavior) {
           respond(cmd.id, 'prompt', true, { disposition: 'queued' });
         } else {
-          runPrompt(cmd.id, cmd.message || '');
+          runPrompt(cmd.id, cmd.message || '', cmd.images);
         }
         break;
       case 'steer':

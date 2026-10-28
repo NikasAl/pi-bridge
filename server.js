@@ -67,6 +67,27 @@ function contentText(c) {
   return c && c.text ? c.text : '';
 }
 
+/* base64-данные картинок не нужны клиентам: в get_messages/событиях они
+ * превращаются в мегабайты трафика при каждом переподключении, а превью на
+ * телефоне всё равно нет (вложение клиент уже видел при отправке).
+ * Вырезаем data, метаданные (mimeType, флаг) оставляем. */
+function stripImageData(v, depth) {
+  if (depth > 12 || v == null) return v;
+  if (Array.isArray(v)) {
+    for (let i = 0; i < v.length; i++) v[i] = stripImageData(v[i], depth + 1);
+    return v;
+  }
+  if (typeof v === 'object') {
+    if (v.type === 'image' && typeof v.data === 'string' && v.data) {
+      v.data = '';
+      v.dataStripped = true;
+      return v;
+    }
+    for (const k in v) stripImageData(v[k], depth + 1);
+  }
+  return v;
+}
+
 function sessionList() {
   return [...sessions.values()].map(s => ({
     id: s.id, name: s.name, alive: !!s.proc,
@@ -126,6 +147,7 @@ function spawnPi(s) {
         continue;
       }
       trackState(s, obj);
+      stripImageData(obj, 0);
       broadcastTo(s, obj);
     }
     if (s.buf.length > 1 << 20) s.buf = '';

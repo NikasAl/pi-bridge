@@ -6,6 +6,7 @@
  *   C) мульти-сессии: create/attach/rename/delete + get_session_stats;
  *   D) preferred session: reconnect с ?session=<id> остаётся на своей сессии;
  *   E) md.js: рендер маркдауна и защита от XSS.
+ *   F) картинки: images проходят в prompt до pi, base64 не попадает клиентам.
  * Запуск: node test/smoke.js   (или npm test)
  */
 'use strict';
@@ -37,7 +38,7 @@ let failed = false;
 function fail(msg) { console.error('FAIL:', msg); failed = true; cleanup(1); }
 function pass(msg) { console.log('PASS:', msg); }
 
-const master = setTimeout(() => fail('общий таймаут теста'), 25000);
+const master = setTimeout(() => fail('общий таймаут теста'), 60000);
 
 /* ---------- D) md.js (чистая функция, без сервера) ---------- */
 function testMd() {
@@ -109,11 +110,15 @@ async function main() {
   await a.waitFor(o => o.type === 'bridge_hello', 'hello');
   await a.waitFor(o => o.type === 'response' && o.command === 'get_state' && o.success, 'get_state');
   const msgsA = await a.waitFor(o => o.type === 'response' && o.command === 'get_messages', 'get_messages');
-  assert.strictEqual(msgsA.data.messages.length, 2, 'история: 2 сообщения');
+  assert.strictEqual(msgsA.data.messages.length, 3, 'история: 3 сообщения');
+  const histImg = msgsA.data.messages[2].content.find(b => b.type === 'image');
+  assert.ok(histImg, 'в истории есть image-блок');
+  assert.strictEqual(histImg.data, '', 'base64 вырезан мостом (стрим истории)');
+  assert.strictEqual(histImg.dataStripped, true, 'флаг dataStripped');
   a.send(JSON.stringify({ type: 'get_session_stats' }));
   const statsA = await a.waitFor(o => o.type === 'response' && o.command === 'get_session_stats' && o.success, 'stats');
   assert.ok(statsA.data.contextUsage && statsA.data.contextUsage.percent === 30, 'contextUsage в stats');
-  pass('A: hello + get_state + get_messages (2 сообщ.) + get_session_stats (ctx 30%)');
+  pass('A: hello + get_state + get_messages (3 сообщ., base64 вырезан) + get_session_stats (ctx 30%)');
 
   a.send('тестовый запрос'); // plain text → мост оборачивает в prompt
   const t0 = a.events.length;
@@ -129,7 +134,7 @@ async function main() {
   const b = makeClient('B');
   await b.waitFor(o => o.type === 'bridge_hello', 'hello B');
   const msgsB = await b.waitFor(o => o.type === 'response' && o.command === 'get_messages', 'get_messages B');
-  assert.strictEqual(msgsB.data.messages.length, 2, 'после ресинка история снова 2 (не 4)');
+  assert.strictEqual(msgsB.data.messages.length, 3, 'после ресинка история снова 3 (не 6)');
   pass('B: переподключение, история отдаётся заново, без удвоения на уровне моста');
 
   b.send(JSON.stringify({ id: 'c1', type: 'prompt', message: 'второй запрос' }));
@@ -200,6 +205,28 @@ async function main() {
   pass('D: ?session= на удалённую сессию → фолбэк на первую (без ошибки)');
 
   d.close(); d2.close(); d3.close();
+
+  /* ---------- F) картинки: pass-through в pi + стрип base64 наружу ---------- */
+  const f = makeClient('F');
+  await f.waitFor(o => o.type === 'bridge_hello', 'hello F');
+  await f.waitFor(o => o.type === 'response' && o.command === 'get_messages', 'get_messages F');
+  f.send(JSON.stringify({
+    id: 'f1', type: 'prompt', message: 'что на фото?',
+    images: [{ type: 'image', data: 'AABBCCDD', mimeType: 'image/png' }],
+  }));
+  const tF = f.events.length;
+  await f.waitFor(o => o.type === 'agent_settled' && f.events.indexOf(o) >= tF, 'agent_settled (F)');
+  const msF = f.events.slice(tF).find(o => o.type === 'message_start' && o.message && o.message.role === 'user');
+  assert.ok(msF && Array.isArray(msF.message.content) && msF.message.content.some(b => b.type === 'image'),
+    'user-сообщение содержит image-блок');
+  const imgBlockF = msF.message.content.find(b => b.type === 'image');
+  assert.strictEqual(imgBlockF.data, '', 'base64 вырезан мостом из живого события');
+  assert.strictEqual(imgBlockF.dataStripped, true, 'флаг dataStripped на живом событии');
+  const tf = textOf(f, tF);
+  assert.ok(/Фото \(1\/image\/png\)/.test(tf), 'images дошли до pi (эхо в тексте): ' + JSON.stringify(tf));
+  pass('F: images проходят в prompt до pi, base64 не попадает клиентам');
+  f.close();
+
   clearTimeout(master);
   console.log('SMOKE OK');
   cleanup(0);
