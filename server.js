@@ -195,6 +195,8 @@ function createSession(name, extraArgs) {
     argsTarget: null,                    // файл сессии, с которым заспавнен pi (для --session)
     named: false,                    // автоимя по первому сообщению уже выставлено
     restarting: false, delayMs: 2000, restartTimer: null, dead: false,
+    lastPrompt: null,                // последний user-промпт (для авто-повтора после санации)
+    recovering: false, recoverPhase: '', recoverAbortTimer: null, recovTimes: [],
     state: { isStreaming: false, sessionFile: null, sessionId: null, thinkingLevel: null },
   };
   sessions.set(id, s);
@@ -217,6 +219,24 @@ function spawnPi(s) {
   broadcastTo(s, { type: 'bridge_status', status: 'pi_up', pid: child.pid });
   broadcastSessions();
 
+  // финализация авто-восстановления: pi перезапустился на санированном файле —
+  // синхронизируем клиентов и повторяем последний user-промпт
+  if (s.recovering && s.recoverPhase === 'restarting') {
+    setTimeout(() => {
+      if (s.dead || !s.proc) return;
+      s.recoverPhase = 'done';
+      s.recovering = false;
+      broadcastTo(s, { type: 'bridge_status', status: 'recovered' });
+      piSend(s, { id: 'sync-' + Date.now(), type: 'get_state' });
+      piSend(s, { id: 'sync-' + Date.now(), type: 'get_messages' });
+      if (s.lastPrompt) {
+        log(`[pi:${s.id}] повтор последнего промпта после санации`);
+        piSend(s, { id: 're-' + Date.now(), type: 'prompt', message: s.lastPrompt });
+        s.lastPrompt = null;
+      }
+    }, 2500);
+  }
+
   // backoff сбрасываем только после 30с устойчивой работы — иначе быстрый краш-луп
   setTimeout(() => { if (s.proc === child) s.delayMs = 2000; }, 30000);
 
@@ -233,6 +253,7 @@ function spawnPi(s) {
         continue;
       }
       trackState(s, obj);
+      if (!s.recovering && !s.dead && looksBrokenToolEvent(obj)) startRecovery(s, 'маркер в RPC-стриме');
       stripImageData(obj, 0);
       broadcastTo(s, obj);
     }
@@ -312,6 +333,163 @@ function deleteSession(id) {
   return true;
 }
 
+/* ---------- страховка «Tool not found»: детект → abort → санация → рестарт ----------
+ *
+ * Симптом: модель иногда отдаёт tool_call с пустыми id и name; pi пишет битую запись,
+ * результат инструмента становится текстом "Tool  not found" (именно ДВА пробела —
+ * маркер), а сессия после resume уже не продолжается. Лечим: abort, вырезание битой
+ * пары из файла сессии, рестарт pi с --session на санированном файле, повтор промпта. */
+const TOOL_NOT_FOUND = 'Tool  not found';
+
+function isBrokenToolCall(b) {
+  return !!b && typeof b === 'object' && (b.type === 'toolCall' || b.type === 'toolcall') && !b.id && !b.name;
+}
+
+function looksBrokenToolEvent(obj) {
+  if (obj.type === 'tool_execution_start' && !obj.toolCallId) return true;
+  if (obj.type === 'tool_execution_end') {
+    if (!obj.toolCallId) return true;
+    const r = obj.result || {};
+    const text = Array.isArray(r.content)
+      ? r.content.filter(b => b && b.type === 'text').map(b => b.text).join('\n')
+      : '';
+    if (text.indexOf(TOOL_NOT_FOUND) >= 0) return true;
+  }
+  if (obj.type === 'message_update' && obj.assistantMessageEvent && obj.assistantMessageEvent.type === 'toolcall_end') {
+    const tc = obj.assistantMessageEvent.toolCall || {};
+    if (!tc.id && !tc.name) return true;
+  }
+  return false;
+}
+
+function startRecovery(s, reason) {
+  if (s.recovering || s.dead) return;
+  const now = Date.now();
+  s.recovTimes = s.recovTimes.filter(t => now - t < 30 * 60000);
+  s.recovTimes.push(now);
+  if (s.recovTimes.length > 3) {
+    // защита от петли: чиним максимум 3 раза за полчаса, дальше — ручной ремонт
+    log(`[pi:${s.id}] recovery skipped: ${s.recovTimes.length}-й раз за 30 мин`);
+    broadcastTo(s, { type: 'bridge_status', status: 'recovery_skipped' });
+    return;
+  }
+  s.recovering = true;
+  s.recoverPhase = 'aborting';
+  log(`[pi:${s.id}] битый tool-call (${reason}): abort → санация → рестарт --session → повтор промпта`);
+  broadcastTo(s, { type: 'bridge_status', status: 'recovering', reason });
+  piSend(s, { type: 'abort' });
+  s.recoverAbortTimer = setTimeout(() => finishAbortPhase(s), 12000); // не дождались settled
+}
+
+function finishAbortPhase(s) {
+  if (!s.recovering || s.recoverPhase !== 'aborting') return;
+  s.recoverPhase = 'restarting';
+  if (s.recoverAbortTimer) { clearTimeout(s.recoverAbortTimer); s.recoverAbortTimer = null; }
+  const file = s.argsTarget || s.state.sessionFile;
+  if (file && fs.existsSync(file)) {
+    try {
+      const res = sanitizeSessionFile(file);
+      log(`[pi:${s.id}] санация ${file}: вырезано записей: ${res.removed}, исправлено сообщений: ${res.repaired}${res.backup ? ', бэкап: ' + res.backup : ''}`);
+    } catch (e) {
+      log(`[pi:${s.id}] санация не удалась: ${e.message}`);
+    }
+  } else {
+    log(`[pi:${s.id}] файла сессии нет — рестарт без санации`);
+  }
+  if (file && !s.argsTarget) {
+    s.args = ARGS.concat(['--session', file]);
+    s.argsTarget = file;
+  }
+  stopSessionProc(s); // exit → scheduleRestart → spawnPi уже с --session
+  // страховка: если процесс не завершился сам — поторопим рестарт
+  setTimeout(() => {
+    if (!s.dead && !s.proc && !s.restarting && s.recoverPhase === 'restarting') scheduleRestart(s);
+  }, 3000);
+}
+
+/* Вырезает из файла сессии битую пару (assistant-запись с toolCall с пустыми id и name
+ * + следующие за ней toolResult с пустым toolCallId) и dangling toolCall без результата
+ * (блок вырезается из сообщения). parentId детей удалённых записей перепривязывается
+ * к живому предку, чтобы дерево сессии не сломалось. Оригинал сохраняется в *.bak-toolnotfound. */
+function sanitizeSessionFile(file) {
+  const raw = fs.readFileSync(file, 'utf8');
+  const lines = raw.split('\n');
+  const entries = lines.map(l => {
+    if (!l.startsWith('{"')) return null;
+    try { return JSON.parse(l); } catch { return null; }
+  });
+  const removed = new Set();
+  let repaired = 0;
+
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (!e || e.type !== 'message' || !e.message) continue;
+    if (e.message.role !== 'assistant' || !Array.isArray(e.message.content)) continue;
+    if (!e.message.content.some(isBrokenToolCall)) continue;
+    // ищем битые toolResult до следующего user/assistant сообщения
+    const pairIdx = [];
+    for (let j = i + 1; j < entries.length; j++) {
+      const ej = entries[j];
+      if (!ej || ej.type !== 'message' || !ej.message) continue;
+      const r = ej.message.role;
+      if (r === 'user' || r === 'assistant') break;
+      if (r === 'toolResult' && !ej.message.toolCallId) pairIdx.push(j);
+    }
+    if (pairIdx.length) {
+      removed.add(i);
+      for (const j of pairIdx) removed.add(j);
+    } else {
+      // dangling: вырезаем только битый блок из сообщения, запись оставляем
+      e.message.content = e.message.content.filter(b => !isBrokenToolCall(b));
+      if (!e.message.content.length) e.message.content = [{ type: 'text', text: '[pi-bridge] битый tool-call вырезан при санации' }];
+      repaired++;
+    }
+  }
+  // осиротевшие toolResult без toolCallId (на случай, если пара не срослась)
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (!e || e.type !== 'message' || !e.message) continue;
+    if (e.message.role === 'toolResult' && !e.message.toolCallId) removed.add(i);
+  }
+
+  if (!removed.size && !repaired) return { removed: 0, repaired: 0, backup: null };
+
+  // перепривязка parentId детей удалённых записей к ближайшему живому предку
+  const keptIds = new Set();
+  entries.forEach((e, i) => { if (e && e.id && !removed.has(i)) keptIds.add(e.id); });
+  const liveAncestor = new Map(); // удалённый id -> живой предок (или null)
+  const byId = new Map();
+  entries.forEach(e => { if (e && e.id) byId.set(e.id, e); });
+  const resolveLive = (id) => {
+    if (liveAncestor.has(id)) return liveAncestor.get(id);
+    let p = id, guard = 0, result = null;
+    while (p && guard++ < 10000) {
+      const pe = byId.get(p);
+      if (!pe) break;
+      if (keptIds.has(p) && p !== id) { result = p; break; }
+      p = pe.parentId;
+    }
+    liveAncestor.set(id, result);
+    return result;
+  };
+  const out = [];
+  entries.forEach((e, i) => {
+    if (!e) { out.push(lines[i]); return; }             // не-JSON строка — как была
+    if (removed.has(i)) return;
+    if (e.parentId && !keptIds.has(e.parentId) && byId.has(e.parentId)) {
+      e.parentId = resolveLive(e.parentId);
+    }
+    out.push(JSON.stringify(e));
+  });
+
+  const backup = file + '.bak-toolnotfound';
+  try { fs.copyFileSync(file, backup); } catch {}
+  const tmp = file + '.tmp-sanitize';
+  fs.writeFileSync(tmp, out.join('\n'));
+  fs.renameSync(tmp, file);
+  return { removed: removed.size, repaired, backup };
+}
+
 /* обновление server-side состояния сессии + автоимя по первому сообщению */
 function trackState(s, obj) {
   if (obj.type === 'response' && obj.command === 'get_state' && obj.success && obj.data) {
@@ -323,7 +501,12 @@ function trackState(s, obj) {
     return;
   }
   if (obj.type === 'agent_start') { s.state.isStreaming = true; broadcastSessions(); return; }
-  if (obj.type === 'agent_settled') { s.state.isStreaming = false; broadcastSessions(); return; }
+  if (obj.type === 'agent_settled') {
+    s.state.isStreaming = false;
+    broadcastSessions();
+    if (s.recovering) finishAbortPhase(s); // abort подтверждён — пора санировать и рестартить
+    return;
+  }
   if (obj.type === 'message_start' && obj.message && obj.message.role === 'user' && !s.named) {
     const t = contentText(obj.message.content).trim().replace(/\s+/g, ' ');
     if (t) {
@@ -453,6 +636,8 @@ wss.on('connection', (ws, req) => {
       // plain text → обычный промпт в текущую сессию
       const s = ws.session;
       if (!s || !s.proc) { sendTo(ws, { type: 'bridge_error', error: 'pi не запущен' }); return; }
+      if (s.recovering) { sendTo(ws, { type: 'bridge_error', error: 'идёт восстановление сессии, попробуйте через несколько секунд' }); return; }
+      s.lastPrompt = text;
       piSend(s, { id: 'p' + Date.now(), type: 'prompt', message: text });
       return;
     }
@@ -464,7 +649,9 @@ wss.on('connection', (ws, req) => {
 
     const s = ws.session;
     if (!s) { sendTo(ws, { type: 'bridge_error', error: 'сессия не выбрана' }); return; }
+    if (s.recovering) { sendTo(ws, { type: 'bridge_error', error: 'идёт восстановление сессии, команда отложена: ' + obj.type }); return; }
     if (!s.proc) { sendTo(ws, { type: 'bridge_error', error: 'pi не запущен, команда не отправлена: ' + obj.type }); return; }
+    if (obj.type === 'prompt' && typeof obj.message === 'string' && obj.message.trim()) s.lastPrompt = obj.message;
     if (!piSend(s, obj)) sendTo(ws, { type: 'bridge_error', error: 'stdin pi недоступен' });
   });
 

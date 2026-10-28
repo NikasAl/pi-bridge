@@ -619,6 +619,9 @@ function handleBridge(o){
       if (o.status === 'pi_up'){ statusState.piUp = true; renderStatus('ok'); }
       else if (o.status === 'pi_down'){ statusState.piUp = false; renderStatus('warn'); setStreaming(false); sysLine('процесс pi завершился (code=' + o.code + '), перезапуск…'); }
       else if (o.status === 'pi_error'){ statusState.piUp = false; renderStatus('err'); sysLine('pi: ' + o.error, true); }
+      else if (o.status === 'recovering'){ sysLine('битый tool-call: прерываю ход, санирую файл сессии, перезапускаю pi…', true); }
+      else if (o.status === 'recovery_skipped'){ sysLine('битый tool-call: авто-восстановление отключено (слишком часто) — нужен ручной ремонт (см. README)', true); }
+      else if (o.status === 'recovered'){ sysLine('сессия восстановлена на санированном файле, последний промпт повторён'); }
       break;
     case 'bridge_stderr': sysLine('pi stderr: ' + short(o.line, 500), true); break;
     case 'bridge_raw': sysLine('pi stdout (не JSON): ' + short(o.line, 500)); break;

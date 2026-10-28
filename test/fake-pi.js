@@ -6,10 +6,49 @@
  */
 'use strict';
 
-// эмулируем CLI-поведение pi: --session <file> выбирает файл сессии
+// эмулируем CLI-поведение pi: --session <file> выбирает файл сессии,
+// --session-dir <dir> — каталог по умолчанию; файл сессии ведём по-настоящему
+// (JSONL), чтобы мост мог тестировать санацию
+const fs = require('fs');
+const path = require('path');
 const argv = process.argv.slice(2);
 function argVal(name) { const i = argv.indexOf(name); return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null; }
-const SESSION_FILE = argVal('--session') || '/tmp/fake-session-' + process.pid + '.jsonl';
+const SESSION_DIR = argVal('--session-dir') || '/tmp';
+const SESSION_FILE = argVal('--session') || path.join(SESSION_DIR, 'fake-' + Date.now() + '_' + process.pid + '.jsonl');
+
+let entrySeq = 0;
+let fileLastId = null;
+function initSessionFile() {
+  try { fs.mkdirSync(path.dirname(SESSION_FILE), { recursive: true }); } catch {}
+  if (fs.existsSync(SESSION_FILE)) {
+    // продолжаем существующий файл: запоминаем id последней записи для parentId-цепочки
+    try {
+      const lines = fs.readFileSync(SESSION_FILE, 'utf8').split('\n').filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try { const e = JSON.parse(lines[i]); if (e && e.id) { fileLastId = e.id; break; } } catch {}
+      }
+    } catch {}
+    return;
+  }
+  const header = { type: 'session', version: 3, id: 'fake-' + process.pid, timestamp: new Date().toISOString(), cwd: process.cwd() };
+  fs.writeFileSync(SESSION_FILE, JSON.stringify(header) + '\n');
+}
+function appendEntry(message, extra) {
+  const e = Object.assign({
+    type: 'message',
+    id: 'fe' + (++entrySeq) + '_' + Math.random().toString(16).slice(2, 6),
+    parentId: fileLastId,
+    timestamp: new Date().toISOString(),
+    message,
+  }, extra || {});
+  fs.appendFileSync(SESSION_FILE, JSON.stringify(e) + '\n');
+  fileLastId = e.id;
+}
+function hasBrokenDoneMarker() {
+  try { return fs.readFileSync(SESSION_FILE, 'utf8').indexOf('"customType":"fake.broken-done"') >= 0; }
+  catch { return false; }
+}
+initSessionFile();
 
 let streaming = false;
 let sessionName = null;
@@ -24,6 +63,24 @@ function respond(id, command, success, data, error) {
 function runPrompt(id, message, images) {
   streaming = true;
   emit({ type: 'agent_start' });
+  appendEntry({ role: 'user', content: message, timestamp: Date.now() });
+  if (/БИТЫЙ/i.test(message) && !hasBrokenDoneMarker()) {
+    // эмуляция бага: tool_call с пустыми id и name → pi пишет битую пару,
+    // результат — "Tool  not found" (два пробела). Маркер-запись custom
+    // гарантирует, что после санации повторный промпт пройдёт нормально.
+    emit({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_start', contentIndex: 0, id: '', toolName: '' } });
+    emit({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_end', contentIndex: 0, toolCall: { id: '', name: '', arguments: {} } } });
+    emit({ type: 'tool_execution_start', toolCallId: '', toolName: '', args: {} });
+    emit({ type: 'tool_execution_end', toolCallId: '', toolName: '', result: { content: [{ type: 'text', text: 'Tool  not found' }] }, isError: true });
+    appendEntry({ role: 'assistant', content: [{ type: 'toolCall', id: '', name: '', arguments: {} }], timestamp: Date.now() });
+    appendEntry({ role: 'toolResult', toolCallId: '', toolName: '', content: [{ type: 'text', text: 'Tool  not found' }], isError: true, timestamp: Date.now() });
+    appendEntry({ type: 'custom', customType: 'fake.broken-done', data: { at: Date.now() } });
+    emit({ type: 'agent_end', messages: [], willRetry: false });
+    emit({ type: 'agent_settled', aborted: false });
+    streaming = false;
+    respond(id, 'prompt', true, { disposition: 'started' });
+    return;
+  }
   const userContent = images && images.length
     ? [{ type: 'text', text: message }, ...images.map(i => ({ type: 'image', data: String(i.data || ''), mimeType: i.mimeType || 'image/png' }))]
     : message;
@@ -36,6 +93,7 @@ function runPrompt(id, message, images) {
     emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: part } });
   }
   emit({ type: 'message_update', assistantMessageEvent: { type: 'text_end', contentIndex: 0, content: 'ok' } });
+  appendEntry({ role: 'assistant', content: [{ type: 'text', text: 'ok: ' + message }], timestamp: Date.now() });
   // tool call
   emit({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_start', contentIndex: 1, id: 'call_1', toolName: 'bash' } });
   emit({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 1, delta: '{"command":"echo hi"}' } });

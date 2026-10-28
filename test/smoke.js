@@ -8,6 +8,7 @@
  *   E) md.js: рендер маркдауна и защита от XSS.
  *   F) картинки: images проходят в prompt до pi, base64 не попадает клиентам.
  *   G) сессии с диска: скан каталога, имена, открытие через spawn --session.
+ *   H) страховка «Tool not found»: детект → abort → санация → рестарт → повтор промпта.
  * Запуск: node test/smoke.js   (или npm test)
  */
 'use strict';
@@ -274,6 +275,41 @@ async function main() {
     'флаг open в списке');
   pass('G: открытая сессия помечена в списке «На диске»');
   g.close();
+
+  /* ---------- H) страховка «Tool not found» ---------- */
+  const fsSync = require('fs');
+  const h = makeClient('H');
+  await h.waitFor(o => o.type === 'bridge_hello', 'hello H');
+  const stH = await h.waitFor(o => o.type === 'response' && o.command === 'get_state' && o.success, 'get_state H');
+  const fileH = stH.data.sessionFile;
+  assert.ok(fileH && fileH.endsWith('.jsonl'), 'файл сессии известен: ' + fileH);
+
+  h.send(JSON.stringify({ id: 'h1', type: 'prompt', message: 'БИТЫЙ тест' }));
+  const rec1 = await h.waitFor(o => o.type === 'bridge_status' && o.status === 'recovering', 'bridge_status recovering', 10000);
+  assert.ok(rec1.reason, 'причина восстановления указана');
+  pass('H: битый tool-call обнаружен (Tool␠␠not found / пустые id), запущено восстановление');
+
+  const rec2 = await h.waitFor(o => o.type === 'bridge_status' && o.status === 'recovered', 'bridge_status recovered', 25000);
+  assert.ok(h.events.some(o => o.type === 'bridge_status' && o.status === 'pi_down'), 'pi перезапускался в ходе восстановления');
+  pass('H: recovery дошёл до конца — pi перезапущен на санированном файле');
+
+  const sanitized = fsSync.readFileSync(fileH, 'utf8');
+  assert.ok(!sanitized.includes('"toolCallId":""'), 'toolResult с пустым toolCallId вырезан');
+  assert.ok(!sanitized.includes('"id":"","name":""'), 'toolCall с пустыми id/name вырезан');
+  assert.ok(sanitized.includes('"role":"user"') && sanitized.includes('fake.broken-done'), 'остальная история жива (user-записи и маркер на месте)');
+  assert.ok(fsSync.existsSync(fileH + '.bak-toolnotfound'), 'бэкап файла сессии создан');
+  pass('H: файл сессии санирован (бита пара вырезана, бэкап создан, история цела)');
+
+  // повтор последнего промпта: после recovered fake-процесс уже «здоров» (маркер),
+  // поэтому тот же текст должен пройти обычным ходом
+  const recIdx = h.events.indexOf(rec2);
+  await h.waitFor(o => o.type === 'agent_settled' && h.events.indexOf(o) > recIdx, 'agent_settled повторного промпта', 15000);
+  const th = textOf(h, recIdx + 1);
+  assert.ok(th.includes('Понял: «БИТЫЙ тест»'), 'последний промпт повторён после санации: ' + JSON.stringify(th));
+  pass('H: последний user-промпт автоматически повторён');
+
+  // команды клиента во время recovery отклоняются с внятной ошибкой (не теряются молча)
+  h.close();
 
   clearTimeout(master);
   console.log('SMOKE OK');
