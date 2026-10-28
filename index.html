@@ -130,6 +130,10 @@
   }
   .srow button.danger{border-color:var(--err);color:var(--err)}
   #dnew{margin-top:10px;width:100%;background:none;border:1px dashed var(--line);color:var(--text);border-radius:8px;padding:8px;font-size:13px}
+  .dsub{margin-top:12px;margin-bottom:2px;font-size:12px}
+  .dsub b{color:var(--dim);font-weight:600}
+  .dsub button{background:none;border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:3px 8px;font-size:11px}
+  .sdate{color:var(--dim);font-size:11px;flex:none}
 </style>
 </head>
 <body>
@@ -143,6 +147,8 @@
   <div class="dhead"><b>Сессии</b><button id="dclose">закрыть</button></div>
   <div id="slist"></div>
   <button id="dnew">+ новая сессия</button>
+  <div class="dhead dsub"><b>На диске (файлы сессий pi)</b><button id="drefresh" title="Обновить список" aria-label="Обновить список">обновить</button></div>
+  <div id="disklist"></div>
 </div>
 
 <div id="log"></div>
@@ -489,6 +495,37 @@ function handleEvent(o){
 }
 
 /* ---------- панель сессий ---------- */
+let diskSessions = [];
+function fmtDate(ms){
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, '0');
+  return p(d.getDate()) + '.' + p(d.getMonth() + 1) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function renderDiskSessions(){
+  const list = $('disklist');
+  list.textContent = '';
+  if (!diskSessions.length){ list.appendChild(div('sys', 'файлы сессий не найдены')); return; }
+  for (const f of diskSessions){
+    const row = div('srow');
+    if (f.open){ const b = document.createElement('span'); b.className = 'srun'; b.textContent = 'открыта'; row.appendChild(b); }
+    const nm = div('sname', f.name);
+    nm.title = f.file + ' · ' + fmtDate(f.mtime);
+    nm.onclick = () => {
+      if (f.open){
+        const s = sessions.find(x => x.file === f.file);
+        if (s) wsSend({ type: 'bridge_attach', session: s.id });
+      } else {
+        wsSend({ type: 'bridge_open_session', file: f.file });
+      }
+      toggleDrawer(false);
+    };
+    const dt = document.createElement('span'); dt.className = 'sdate'; dt.textContent = fmtDate(f.mtime);
+    row.appendChild(nm); row.appendChild(dt);
+    list.appendChild(row);
+  }
+}
+function requestDiskSessions(force){ wsSend({ type: 'bridge_list_disk_sessions', force: !!force }); }
+
 function renderSessions(){
   const list = $('slist');
   list.textContent = '';
@@ -531,6 +568,10 @@ function handleBridge(o){
     case 'bridge_sessions':
       sessions = o.sessions || [];
       renderSessions();
+      break;
+    case 'bridge_disk_sessions':
+      diskSessions = o.sessions || [];
+      renderDiskSessions();
       break;
     case 'bridge_status':
       if (o.status === 'pi_up'){ statusState.piUp = true; renderStatus('ok'); }
@@ -670,8 +711,13 @@ inEl.addEventListener('keydown', (e) => {
 });
 $('abort').onclick = () => wsSend({ type: 'abort' });
 $('mode').onclick = () => { mode = mode === 'steer' ? 'follow_up' : 'steer'; setStreaming(streaming); };
-$('tabs').onclick = () => toggleDrawer(!$('drawer').classList.contains('open'));
+$('tabs').onclick = () => {
+  const opening = !$('drawer').classList.contains('open');
+  toggleDrawer(opening);
+  if (opening) requestDiskSessions(false); // сервер отдаёт кэш (30с) мгновенно
+};
 $('dclose').onclick = () => toggleDrawer(false);
+$('drefresh').onclick = () => requestDiskSessions(true);
 $('dnew').onclick = () => { wsSend({ type: 'bridge_create_session' }); toggleDrawer(false); };
 $('jump').onclick = () => { stick = true; scrollBottom(); };
 logEl.addEventListener('scroll', () => {

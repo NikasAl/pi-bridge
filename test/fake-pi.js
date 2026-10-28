@@ -6,6 +6,11 @@
  */
 'use strict';
 
+// эмулируем CLI-поведение pi: --session <file> выбирает файл сессии
+const argv = process.argv.slice(2);
+function argVal(name) { const i = argv.indexOf(name); return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null; }
+const SESSION_FILE = argVal('--session') || '/tmp/fake-session-' + process.pid + '.jsonl';
+
 let streaming = false;
 let sessionName = null;
 
@@ -61,7 +66,7 @@ process.stdin.on('data', (c) => {
         respond(cmd.id, 'get_state', true, {
           model: { id: 'fake-model', name: 'Fake Model' },
           thinkingLevel: 'medium', isStreaming: streaming, isCompacting: false,
-          sessionFile: '/tmp/fake-session-' + process.pid + '.jsonl', sessionId: 'fake123',
+          sessionFile: SESSION_FILE, sessionId: 'fake123',
           sessionName: sessionName || undefined,
           messageCount: 2, pendingMessageCount: 0,
         });

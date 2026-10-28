@@ -7,6 +7,7 @@
  *   D) preferred session: reconnect с ?session=<id> остаётся на своей сессии;
  *   E) md.js: рендер маркдауна и защита от XSS.
  *   F) картинки: images проходят в prompt до pi, base64 не попадает клиентам.
+ *   G) сессии с диска: скан каталога, имена, открытие через spawn --session.
  * Запуск: node test/smoke.js   (или npm test)
  */
 'use strict';
@@ -226,6 +227,53 @@ async function main() {
   assert.ok(/Фото \(1\/image\/png\)/.test(tf), 'images дошли до pi (эхо в тексте): ' + JSON.stringify(tf));
   pass('F: images проходят в prompt до pi, base64 не попадает клиентам');
   f.close();
+
+  /* ---------- G) сессии с диска: скан + открытие через --session ---------- */
+  const fsp = require('fs').promises;
+  const sessDir = '/tmp/pi-bridge-test-sessions';
+  await fsp.mkdir(sessDir, { recursive: true });
+  const mkSession = (id, name) => [
+    JSON.stringify({ type: 'session', version: 3, id, timestamp: '2026-01-01T10:00:00.000Z', cwd: '/tmp' }),
+    JSON.stringify({ type: 'message', id: 'm1', parentId: null, timestamp: '2026-01-01T10:00:01.000Z', message: { role: 'user', content: 'Первый промпт сессии ' + id, timestamp: Date.now() } }),
+    JSON.stringify({ type: 'message', id: 'm2', parentId: 'm1', timestamp: '2026-01-01T10:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'ответ' }], timestamp: Date.now() } }),
+    JSON.stringify({ type: 'session_info', id: 'm3', parentId: 'm2', timestamp: '2026-01-01T10:00:03.000Z', name }),
+  ].join('\n') + '\n';
+  const fileA = path.join(sessDir, '2026-01-01T100000_000Z_aaaaaaa1.jsonl');
+  const fileB = path.join(sessDir, '2026-01-02T100000_000Z_bbbbbbb2.jsonl');
+  await fsp.writeFile(fileA, mkSession('aaaaaaa1', 'Дисковая сессия А'));
+  await fsp.writeFile(fileB, mkSession('bbbbbbb2', ''));
+
+  const g = makeClient('G');
+  await g.waitFor(o => o.type === 'bridge_hello', 'hello G');
+  g.send(JSON.stringify({ type: 'bridge_list_disk_sessions', force: true }));
+  const disk = await g.waitFor(o => o.type === 'bridge_disk_sessions', 'bridge_disk_sessions');
+  const fa = disk.sessions.find(x => x.file === fileA);
+  const fb = disk.sessions.find(x => x.file === fileB);
+  assert.ok(fa && fa.name === 'Дисковая сессия А', 'имя из session_info: ' + JSON.stringify(fa));
+  assert.ok(fb && fb.name === 'Первый промпт сессии bbbbbbb2', 'имя из первого user-сообщения');
+  assert.ok(fb.mtime >= fa.mtime, 'fileB записан позже fileA (mtime честный)');
+  assert.ok(disk.sessions.every((x, i) => i === 0 || disk.sessions[i - 1].mtime >= x.mtime), 'сортировка mtime desc');
+  pass('G: скан каталога сессий — имена из session_info/первого промпта, сортировка');
+
+  const beforeG = helloActive(g);
+  g.send(JSON.stringify({ type: 'bridge_open_session', file: fileA }));
+  const helloG = await g.waitFor(o => o.type === 'bridge_hello' && o.active !== beforeG, 'hello открытой сессии');
+  const gs = await g.waitFor(o => o.type === 'response' && o.command === 'get_state' && o.success && o.data.sessionFile === fileA,
+    'get_state открытой сессии');
+  assert.strictEqual(gs.data.sessionFile, fileA, 'pi заспавнен с --session <file> (argv до fake-pi дошёл)');
+  assert.ok(helloG.sessions.some(x => x.id === helloG.active && x.file === fileA), 'файл сессии в списке мост-сессий');
+  pass('G: открытие сессии — новый процесс pi с --session, клиент привязан');
+
+  g.send(JSON.stringify({ type: 'bridge_open_session', file: fileA }));
+  const dupG = await g.waitFor(o => o.type === 'bridge_error', 'ошибка повторного открытия');
+  assert.ok(/уже открыта/.test(dupG.error), 'текст ошибки про уже открытую сессию');
+  pass('G: повторное открытие той же сессии отклоняется (защита от двух писателей)');
+
+  g.send(JSON.stringify({ type: 'bridge_list_disk_sessions', force: true }));
+  await g.waitFor(o => o.type === 'bridge_disk_sessions' && (o.sessions.find(x => x.file === fileA) || {}).open,
+    'флаг open в списке');
+  pass('G: открытая сессия помечена в списке «На диске»');
+  g.close();
 
   clearTimeout(master);
   console.log('SMOKE OK');

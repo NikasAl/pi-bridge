@@ -18,6 +18,8 @@
  *   bridge_attach {session}          — привязать этот WS к сессии
  *   bridge_rename_session {session,name}
  *   bridge_delete_session {session}  — убить процесс и удалить файл сессии
+ *   bridge_list_disk_sessions {force}  — скан каталога сессий pi на диске
+ *   bridge_open_session {file}       — открыть файл сессии (spawn pi с --session)
  *
  * Авторизации НЕТ — закрывать nginx'ом (basic auth + TLS). Слушает 0.0.0.0:PORT.
  *
@@ -34,6 +36,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawn } = require('child_process');
 const { WebSocketServer } = require('ws');
 
@@ -45,6 +48,11 @@ const ARGS = (process.env.PI_BRIDGE_ARGS || '--mode rpc').split(' ').filter(Bool
 if (process.env.PI_BRIDGE_SESSION_DIR) {
   ARGS.push('--session-dir', process.env.PI_BRIDGE_SESSION_DIR);
 }
+// где pi хранит файлы сессий (~/.pi/agent/sessions/--<cwd>--/<ts>_<id>.jsonl);
+// при заданном PI_BRIDGE_SESSION_DIR совпадает с ним, иначе — дефолт pi
+const SESSIONS_ROOT = process.env.PI_BRIDGE_SESSION_DIR
+  ? path.resolve(process.env.PI_BRIDGE_SESSION_DIR)
+  : path.join(os.homedir(), '.pi', 'agent', 'sessions');
 
 const sessions = new Map();   // id -> session
 const allClients = new Set(); // все ws (для bridge_sessions)
@@ -92,6 +100,7 @@ function sessionList() {
   return [...sessions.values()].map(s => ({
     id: s.id, name: s.name, alive: !!s.proc,
     streaming: !!s.state.isStreaming,
+    file: s.argsTarget || s.state.sessionFile || null,
   }));
 }
 function broadcastSessions() {
@@ -99,14 +108,91 @@ function broadcastSessions() {
   for (const ws of allClients) if (ws.readyState === ws.OPEN) ws.send(msg);
 }
 
+/* ---------- сессии на диске: скан каталога pi ---------- */
+
+/* RPC-команды «список сессий» у pi нет — сканируем файлы сами.
+ * Формат: ~/.pi/agent/sessions/--<cwd>--/<timestamp>_<uuid>.jsonl; первая строка —
+ * заголовок {type:"session", id, cwd, ...}, имя — в записях session_info. */
+let diskCache = { at: 0, list: [] };
+const DISK_TTL = 30000;
+
+function openSessionFiles() {
+  const set = new Set();
+  for (const s of sessions.values()) {
+    const f = s.argsTarget || s.state.sessionFile;
+    if (f) set.add(f);
+  }
+  return set;
+}
+
+async function listDiskSessions(force) {
+  if (!force && Date.now() - diskCache.at < DISK_TTL) return diskCache.list;
+  let files = [];
+  try {
+    const root = await fs.promises.readdir(SESSIONS_ROOT, { withFileTypes: true });
+    for (const e of root) {
+      const p = path.join(SESSIONS_ROOT, e.name);
+      if (e.isDirectory()) {
+        try {
+          const inner = await fs.promises.readdir(p, { withFileTypes: true });
+          for (const ie of inner) if (ie.isFile() && ie.name.endsWith('.jsonl')) files.push(path.join(p, ie.name));
+        } catch {}
+      } else if (e.isFile() && e.name.endsWith('.jsonl')) {
+        files.push(p);
+      }
+    }
+  } catch {
+    diskCache = { at: Date.now(), list: [] };
+    return [];
+  }
+  const stats = await Promise.all(files.map(async f => {
+    try { const st = await fs.promises.stat(f); return { f, mtime: st.mtimeMs, size: st.size }; } catch { return null; }
+  }));
+  const sorted = stats.filter(Boolean).sort((a, b) => b.mtime - a.mtime).slice(0, 200);
+  const openSet = openSessionFiles();
+  const list = [];
+  for (const { f, mtime, size } of sorted) {
+    const meta = { id: null, cwd: null, name: '', firstText: '', firstDone: false };
+    try {
+      const content = await fs.promises.readFile(f, 'utf8');
+      for (const line of content.split('\n')) {
+        if (!line.startsWith('{"type":"')) continue;
+        if (!meta.id && line.startsWith('{"type":"session"')) {
+          try { const h = JSON.parse(line); meta.id = h.id; meta.cwd = h.cwd; } catch {}
+        } else if (line.startsWith('{"type":"session_info"')) {
+          try { const si = JSON.parse(line); if (si.name) meta.name = String(si.name); } catch {}
+        } else if (!meta.firstDone && line.length < 300000 && line.startsWith('{"type":"message"')) {
+          try {
+            const en = JSON.parse(line);
+            if (en.message && en.message.role === 'user') {
+              const t = contentText(en.message.content).trim().replace(/\s+/g, ' ');
+              if (t) { meta.firstText = t; meta.firstDone = true; }
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+    const shortName = meta.name || (meta.firstText ? meta.firstText.slice(0, 48) + (meta.firstText.length > 48 ? '…' : '') : '');
+    list.push({
+      file: f, id: meta.id, cwd: meta.cwd, mtime, size,
+      name: shortName || path.basename(f),
+      open: openSet.has(f),
+    });
+  }
+  diskCache = { at: Date.now(), list };
+  return list;
+}
+
 /* ---------- сессия = отдельный процесс pi ---------- */
 
-function createSession(name) {
+function createSession(name, extraArgs) {
   const id = 's' + (++seq);
   const s = {
     id, seq,
     name: (name || 'Сессия ' + seq).slice(0, 80),
     proc: null, buf: '', clients: new Set(),
+    args: ARGS.concat(extraArgs || []),   // per-session аргументы спавна (напр. --session <file>)
+    argsTarget: null,                    // файл сессии, с которым заспавнен pi (для --session)
     named: false,                    // автоимя по первому сообщению уже выставлено
     restarting: false, delayMs: 2000, restartTimer: null, dead: false,
     state: { isStreaming: false, sessionFile: null, sessionId: null, thinkingLevel: null },
@@ -117,10 +203,10 @@ function createSession(name) {
 }
 
 function spawnPi(s) {
-  log(`[pi:${s.id}] spawn: ${CMD} ${ARGS.join(' ')} (cwd=${CWD})`);
+  log(`[pi:${s.id}] spawn: ${CMD} ${s.args.join(' ')} (cwd=${CWD})`);
   let child;
   try {
-    child = spawn(CMD, ARGS, { cwd: CWD, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    child = spawn(CMD, s.args, { cwd: CWD, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
   } catch (e) {
     log(`[pi:${s.id}] spawn error:`, e.message);
     broadcastTo(s, { type: 'bridge_status', status: 'pi_error', error: e.message });
@@ -211,6 +297,7 @@ function deleteSession(id) {
   s.dead = true;
   if (s.restartTimer) clearTimeout(s.restartTimer);
   const file = s.state.sessionFile;
+  diskCache.at = 0; // список на диске изменился (файл будет удалён)
   stopSessionProc(s);
   sessions.delete(id);
   if (file) fs.unlink(file, () => {}); // удалить файл сессии с диска (best effort)
@@ -292,6 +379,27 @@ function handleBridgeCommand(ws, obj) {
       const id = obj.session || (ws.session && ws.session.id);
       if (!sessions.has(id)) { sendTo(ws, { type: 'bridge_error', error: 'нет такой сессии: ' + id }); break; }
       deleteSession(id);
+      break;
+    }
+    case 'bridge_list_disk_sessions': {
+      listDiskSessions(!!obj.force)
+        .then(list => sendTo(ws, { type: 'bridge_disk_sessions', sessions: list }))
+        .catch(e => sendTo(ws, { type: 'bridge_error', error: 'скан сессий: ' + e.message }));
+      break;
+    }
+    case 'bridge_open_session': {
+      const file = obj.file ? path.resolve(String(obj.file)) : '';
+      if (!file || !file.endsWith('.jsonl')) { sendTo(ws, { type: 'bridge_error', error: 'open: нужен путь к .jsonl' }); break; }
+      if (!fs.existsSync(file)) { sendTo(ws, { type: 'bridge_error', error: 'файл сессии не найден: ' + file }); break; }
+      const busy = [...sessions.values()].find(x => (x.argsTarget || x.state.sessionFile) === file);
+      if (busy) { sendTo(ws, { type: 'bridge_error', error: 'сессия уже открыта в мосте' }); attach(ws, busy); break; }
+      const meta = diskCache.list.find(x => x.file === file);
+      const s = createSession(meta && meta.name ? meta.name : undefined, ['--session', file]);
+      s.argsTarget = file;
+      log(`[session] open from disk: ${file}`);
+      attach(ws, s);
+      diskCache.at = 0; // флаг open в списке устарел
+      broadcastSessions();
       break;
     }
     default:
