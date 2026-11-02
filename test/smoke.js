@@ -311,6 +311,40 @@ async function main() {
   // команды клиента во время recovery отклоняются с внятной ошибкой (не теряются молча)
   h.close();
 
+  /* ---------- I) выбор модели: список, set_model/cycle_model, мышление ---------- */
+  const i = makeClient('I');
+  await i.waitFor(o => o.type === 'bridge_hello', 'hello I');
+  await i.waitFor(o => o.type === 'response' && o.command === 'get_state' && o.success, 'get_state I');
+
+  i.send(JSON.stringify({ id: 'i1', type: 'get_available_models' }));
+  const lvl = await i.waitFor(o => o.type === 'response' && o.command === 'get_available_models' && o.success, 'get_available_models');
+  assert.ok(Array.isArray(lvl.data.models) && lvl.data.models.length >= 3, 'список моделей (3+)');
+  assert.ok(lvl.data.models.some(m => m.id === 'fake-model' && m.provider === 'fake'), 'есть fake-model/fake');
+  pass('I: get_available_models — список моделей проходит через мост к клиенту');
+
+  i.send(JSON.stringify({ id: 'i2', type: 'set_model', provider: 'fake', modelId: 'fake-pro' }));
+  const setI = await i.waitFor(o => o.type === 'response' && o.command === 'set_model' && o.success, 'set_model');
+  assert.strictEqual(setI.data.id, 'fake-pro', 'set_model вернул выбранную модель');
+  i.send(JSON.stringify({ id: 'i3', type: 'get_state' }));
+  const stI = await i.waitFor(o => o.type === 'response' && o.command === 'get_state' && o.success && o.data.model && o.data.model.id === 'fake-pro', 'get_state после set_model');
+  assert.strictEqual(stI.data.model.id, 'fake-pro', 'состояние сессии отражает новую модель');
+  pass('I: set_model переключает модель сессии (подтверждается get_state)');
+
+  i.send(JSON.stringify({ id: 'i4', type: 'cycle_model' }));
+  const cyI = await i.waitFor(o => o.type === 'response' && o.command === 'cycle_model' && o.success && o.data.model, 'cycle_model');
+  assert.ok(cyI.data.model.id !== 'fake-pro', 'cycle_model ушёл с текущей модели');
+  pass('I: cycle_model — следующая модель');
+
+  i.send(JSON.stringify({ id: 'i5', type: 'get_available_thinking_levels' }));
+  await i.waitFor(o => o.type === 'response' && o.command === 'get_available_thinking_levels' && o.success && Array.isArray(o.data.levels) && o.data.levels.includes('off'), 'уровни мышления');
+  i.send(JSON.stringify({ id: 'i6', type: 'set_thinking_level', level: 'high' }));
+  await i.waitFor(o => o.type === 'response' && o.command === 'set_thinking_level' && o.success, 'set_thinking_level');
+  i.send(JSON.stringify({ id: 'i7', type: 'get_state' }));
+  const stT = await i.waitFor(o => o.type === 'response' && o.command === 'get_state' && o.success && o.data.thinkingLevel === 'high', 'get_state уровень мышления');
+  assert.strictEqual(stT.data.thinkingLevel, 'high', 'уровень мышления сменился');
+  pass('I: мышление — список уровней + установка high подтверждается get_state');
+  i.close();
+
   clearTimeout(master);
   console.log('SMOKE OK');
   cleanup(0);

@@ -53,6 +53,16 @@ initSessionFile();
 let streaming = false;
 let sessionName = null;
 
+// состояние модели/мышления для тестов «выбора модели»
+const MODELS = [
+  { id: 'fake-model', name: 'Fake Model', provider: 'fake', input: ['text', 'image'], contextWindow: 200000 },
+  { id: 'fake-pro', name: 'Fake Pro', provider: 'fake', input: ['text', 'image'], contextWindow: 200000, reasoning: true },
+  { id: 'gpt-x', name: 'GPT-X (без vision)', provider: 'other', input: ['text'], contextWindow: 100000 },
+];
+const THINK_LEVELS = ['off', 'low', 'medium', 'high'];
+let curModel = MODELS[0];
+let thinkingLevel = 'medium';
+
 function emit(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
 function respond(id, command, success, data, error) {
   const r = { id, type: 'response', command, success };
@@ -122,8 +132,8 @@ process.stdin.on('data', (c) => {
     switch (cmd.type) {
       case 'get_state':
         respond(cmd.id, 'get_state', true, {
-          model: { id: 'fake-model', name: 'Fake Model' },
-          thinkingLevel: 'medium', isStreaming: streaming, isCompacting: false,
+          model: curModel,
+          thinkingLevel, isStreaming: streaming, isCompacting: false,
           sessionFile: SESSION_FILE, sessionId: 'fake123',
           sessionName: sessionName || undefined,
           messageCount: 2, pendingMessageCount: 0,
@@ -176,6 +186,29 @@ process.stdin.on('data', (c) => {
         break;
       case 'new_session':
         respond(cmd.id, 'new_session', true, { cancelled: false });
+        break;
+      case 'get_available_models':
+        respond(cmd.id, 'get_available_models', true, { models: MODELS });
+        break;
+      case 'set_model': {
+        const m = MODELS.find(x => x.id === cmd.modelId && String(x.provider) === String(cmd.provider));
+        if (!m) { respond(cmd.id, 'set_model', false, null, 'модель не найдена: ' + cmd.modelId); break; }
+        curModel = m;
+        respond(cmd.id, 'set_model', true, m);
+        break;
+      }
+      case 'cycle_model': {
+        const idx = MODELS.findIndex(x => x.id === curModel.id);
+        curModel = MODELS[(idx + 1) % MODELS.length];
+        respond(cmd.id, 'cycle_model', true, { model: curModel, thinkingLevel });
+        break;
+      }
+      case 'get_available_thinking_levels':
+        respond(cmd.id, 'get_available_thinking_levels', true, { levels: THINK_LEVELS });
+        break;
+      case 'set_thinking_level':
+        if (THINK_LEVELS.includes(cmd.level)) thinkingLevel = cmd.level;
+        respond(cmd.id, 'set_thinking_level', true);
         break;
       default:
         respond(cmd.id, cmd.type, true, {});

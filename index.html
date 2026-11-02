@@ -149,12 +149,26 @@
     display:inline-flex;align-items:center;justify-content:center;
   }
   .sdate{color:var(--dim);font-size:11px;flex:none}
+  /* панель выбора модели */
+  #moddrawer{display:none;position:fixed;z-index:12;left:0;right:0;top:0;max-height:75%;overflow-y:auto;background:var(--panel);border-bottom:2px solid var(--line);padding:10px 12px;padding-top:calc(10px + env(safe-area-inset-top))}
+  #moddrawer.open{display:block}
+  #model{cursor:pointer}
+  .mrow{display:flex;align-items:center;padding:8px 2px;border-bottom:1px solid var(--line)}
+  .mrow > * + *{margin-left:8px}
+  .mrow.cur{background:rgba(77,163,255,.08)}
+  .mname{flex:1;min-width:0}
+  .mname .t{display:block;color:var(--text);font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mname .s{display:block;color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mcheck{color:var(--accent);flex:none;font-weight:700}
+  #mact{color:var(--dim);font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tbtn{border:1px solid var(--line);background:none;color:var(--dim);border-radius:16px;padding:4px 12px;font-size:12px;margin:0 6px 6px 0}
+  .tbtn.cur{color:var(--accent);border-color:var(--accent)}
 </style>
 </head>
 <body>
 <header>
   <div id="dot"></div>
-  <div id="model">подключение…</div>
+  <div id="model" role="button" tabindex="0" title="Выбрать модель" aria-label="Выбрать модель">подключение…</div>
   <button id="tabs" title="Сессии" aria-label="Сессии">
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>
   </button>
@@ -172,6 +186,20 @@
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 4v6h-6M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
   </button></div>
   <div id="disklist"></div>
+</div>
+
+<div id="moddrawer">
+  <div class="dhead"><b>Модель</b><span id="mact"></span>
+    <button id="mcycle" title="Следующая модель" aria-label="Следующая модель">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+    </button>
+    <button id="mclose" title="Закрыть" aria-label="Закрыть выбор модели">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+  <div id="mlist"></div>
+  <div class="dhead dsub"><b>Мышление</b></div>
+  <div id="tlist"></div>
 </div>
 
 <div id="log"></div>
@@ -233,7 +261,9 @@ let activeId = null;            // текущая привязанная сес�
 const LS_ACTIVE = 'piBridgeActiveSession';
 function saveActive(id){ try { localStorage.setItem(LS_ACTIVE, String(id)); } catch (e) {} }
 function loadActive(){ try { return localStorage.getItem(LS_ACTIVE); } catch (e) { return null; } }
-const statusState = { model: null, think: null, ctx: null, streaming: false, piUp: null };
+const statusState = { model: null, modelId: null, provider: null, think: null, ctx: null, streaming: false, piUp: null };
+let availableModels = [];          // все настроенные модели pi [{id,name,provider,...}]
+let thinkingLevels = [];           // уровни мышления текущей модели
 const toolLines = new Map();    // toolCallId -> элемент строки инструмента
 
 /* ---------- утилиты DOM ---------- */
@@ -270,6 +300,8 @@ function renderStatus(cls){
 function applyState(o){
   if (o.model){
     statusState.model = o.model.name || o.model.id;
+    statusState.modelId = o.model.id || null;
+    statusState.provider = o.model.provider || null;
     // модели без vision — кнопку прикрепа гасим заранее (model.input из get_state)
     setAttachEnabled(!Array.isArray(o.model.input) || o.model.input.indexOf('image') >= 0);
   }
@@ -446,6 +478,39 @@ function handleEvent(o){
           (o.success ? ' [' + (d.disposition || 'ok') + ']' : '') + (o.success ? '' : ': ' + (o.error || 'ошибка')), !o.success);
         break;
       }
+      if (o.command === 'get_available_models'){
+        if (o.success){ availableModels = (o.data && o.data.models) || []; renderModelList(); }
+        break;
+      }
+      if (o.command === 'get_available_thinking_levels'){
+        if (o.success){ thinkingLevels = (o.data && o.data.levels) || []; renderThinkList(); }
+        break;
+      }
+      if (o.command === 'set_model' || o.command === 'cycle_model'){
+        if (o.success){
+          const md = (o.command === 'set_model' ? o.data : (o.data && o.data.model)) || {};
+          if (md.id || md.name){
+            statusState.model = md.name || md.id;
+            statusState.modelId = md.id || null;
+            statusState.provider = md.provider || null;
+            setAttachEnabled(!Array.isArray(md.input) || md.input.indexOf('image') >= 0);
+            renderStatus();
+            renderModelList();
+          }
+          sysLine((o.command === 'set_model' ? 'модель переключена: ' : 'следующая модель: ') +
+            ((md.name || md.id) || 'ok'));
+          wsSend({ type: 'get_state' });
+          wsSend({ type: 'get_session_stats' });
+        }
+        break;
+      }
+      if (o.command === 'set_thinking_level'){
+        if (o.success){
+          sysLine('уровень мышления установлен');
+          wsSend({ type: 'get_state' });
+        }
+        break;
+      }
       if (o.success === false) sysLine(o.command + ': ' + (o.error || 'ошибка'), true);
       break;
     }
@@ -594,6 +659,59 @@ function renderSessions(){
   }
 }
 function toggleDrawer(v){ $('drawer').classList.toggle('open', v); }
+
+/* ---------- панель выбора модели ---------- */
+function renderModelList(){
+  const l = $('mlist'); l.textContent = '';
+  $('mact').textContent = 'сейчас: ' + (statusState.model || '?');
+  if (!availableModels.length){ l.appendChild(div('sys', 'список моделей не получен')); return; }
+  for (const m of availableModels){
+    const cur = !!m.id && m.id === statusState.modelId && (!m.provider || m.provider === statusState.provider);
+    const row = div('mrow' + (cur ? ' cur' : ''));
+    const nm = document.createElement('div'); nm.className = 'mname';
+    const t = document.createElement('span'); t.className = 't'; t.textContent = m.name || m.id; nm.appendChild(t);
+    const s = document.createElement('span'); s.className = 's'; s.textContent = (m.provider || 'provider') + ' · ' + (m.id || ''); nm.appendChild(s);
+    row.appendChild(nm);
+    if (cur){ const ck = document.createElement('span'); ck.className = 'mcheck'; ck.textContent = '✓'; row.appendChild(ck); }
+    row.title = 'Переключиться на эту модель';
+    row.onclick = () => switchModel(m);
+    l.appendChild(row);
+  }
+}
+function renderThinkList(){
+  const l = $('tlist'); l.textContent = '';
+  if (!thinkingLevels.length){ l.appendChild(div('sys', 'текущая модель не поддерживает уровни мышления')); return; }
+  for (const lvl of thinkingLevels){
+    const b = document.createElement('button');
+    b.className = 'tbtn' + (lvl === statusState.think ? ' cur' : '');
+    b.textContent = lvl;
+    b.title = b.ariaLabel = 'Уровень мышления: ' + lvl;
+    b.onclick = () => wsSend({ type: 'set_thinking_level', level: lvl });
+    l.appendChild(b);
+  }
+}
+function switchModel(m){
+  if (!m || !m.id || !m.provider) return;
+  sysLine('переключаю модель: ' + (m.name || m.id));
+  wsSend({ type: 'set_model', provider: m.provider, modelId: m.id });
+}
+function openModelPanel(){
+  const opening = !$('moddrawer').classList.contains('open');
+  toggleDrawer(false);
+  $('moddrawer').classList.toggle('open', opening);
+  if (opening){
+    $('mlist').textContent = ''; $('tlist').textContent = '';
+    $('mlist').appendChild(div('sys', 'загрузка…'));
+    wsSend({ type: 'get_available_models' });
+    wsSend({ type: 'get_available_thinking_levels' });
+  }
+}
+$('mclose').onclick = () => $('moddrawer').classList.remove('open');
+$('mcycle').onclick = () => wsSend({ type: 'cycle_model' });
+modelEl.onclick = () => openModelPanel();
+modelEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); openModelPanel(); }
+});
 
 /* ---------- события моста ---------- */
 function handleBridge(o){
