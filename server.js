@@ -34,6 +34,8 @@
  *                     дефолт ~/myprjs/Ideal); те же корни использует тул
  *                     send_media из extension/send-media.js
  *   PI_BRIDGE_SESSION_DIR  если задан — добавит "--session-dir <dir>"
+ *   PI_BRIDGE_MEDIA_EXT   0/off — не подключать расширение send_media
+ *                         (по умолчанию подключается из <repo>/extension/)
  */
 'use strict';
 
@@ -52,6 +54,15 @@ const ARGS = (process.env.PI_BRIDGE_ARGS || '--mode rpc').split(' ').filter(Bool
 if (process.env.PI_BRIDGE_SESSION_DIR) {
   ARGS.push('--session-dir', process.env.PI_BRIDGE_SESSION_DIR);
 }
+/* ---------- расширение send_media ----------
+ * Инструмент выдачи файлов в чат (extension/send-media.js) грузится в каждый
+ * спавн pi через --extension — поэтому он есть ТОЛЬКО в сессиях моста, а не во
+ * всех pi-сессиях машины (user-каталог ~/.pi/agent/extensions не используется).
+ * Отключить: PI_BRIDGE_MEDIA_EXT=0 (например, в smoke-тестах с fake-pi). */
+const MEDIA_EXT_PATH = path.join(__dirname, 'extension', 'send-media.js');
+const MEDIA_EXT_ON = !/^(0|false|off|no)$/i.test(String(process.env.PI_BRIDGE_MEDIA_EXT || ''));
+const MEDIA_EXT_ACTIVE = MEDIA_EXT_ON && fs.existsSync(MEDIA_EXT_PATH);
+if (MEDIA_EXT_ACTIVE) ARGS.push('--extension', MEDIA_EXT_PATH);
 // где pi хранит файлы сессий (~/.pi/agent/sessions/--<cwd>--/<ts>_<id>.jsonl);
 // при заданном PI_BRIDGE_SESSION_DIR совпадает с ним, иначе — дефолт pi
 const SESSIONS_ROOT = process.env.PI_BRIDGE_SESSION_DIR
@@ -809,8 +820,12 @@ wss.on('connection', (ws, req) => {
 });
 
 server.listen(PORT, HOST, () => {
-  log(`pi-bridge: http://${HOST}:${PORT}  (page /, ws /ws, health /healthz)`);
+  log(`pi-bridge: http://${HOST}:${PORT}  (page /, ws /ws, health /healthz, media /media)`);
   log(`pi cwd: ${CWD}`);
+  log(MEDIA_EXT_ACTIVE
+    ? `media: тул send_media подключен (--extension ${MEDIA_EXT_PATH})`
+    : 'media: расширение send_media выключено (PI_BRIDGE_MEDIA_EXT или файла нет)');
+  log(`media: корни /media: ${mediaRoots().join(':') || '(пусто)'}`);
   createSession(); // сессия по умолчанию
 });
 
