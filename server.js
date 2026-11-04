@@ -191,12 +191,16 @@ async function handleMedia(req, res, u) {
     }
     real = rf;
   } else {
+    let escaped = false;   // realpath есть, но вне корней (../, симлинк) → это 403, а не 404
     for (const r of roots) {
       let rf = null;
       try { rf = await fs.promises.realpath(path.resolve(r, q)); } catch { continue; }
       if (rf === r || rf.startsWith(r + path.sep)) { real = rf; break; }
+      escaped = true;
     }
-    if (!real) return plain(403, 'media: относительный путь не разрешается внутрь MEDIA_DIRS (или файл вне корней)');
+    if (!real) {
+      return plain(escaped ? 403 : 404, escaped ? 'media: путь вне MEDIA_DIRS' : 'media: файл не найден');
+    }
   }
 
   const ext = path.extname(real).slice(1).toLowerCase();

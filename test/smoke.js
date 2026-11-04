@@ -9,6 +9,9 @@
  *   F) картинки: images проходят в prompt до pi, base64 не попадает клиентам.
  *   G) сессии с диска: скан каталога, имена, открытие через spawn --session.
  *   H) страховка «Tool not found»: детект → abort → санация → рестарт → повтор промпта.
+ *   I) выбор модели: список, set_model/cycle_model, мышление.
+ *   J) GET /media: 200/206/416/403 (traversal, симлинк, ext)/404/304/HEAD/dl.
+ *   K) send_media: тул-события + карточка (media-card.js в stub-DOM) + ресинк из истории.
  * Запуск: node test/smoke.js   (или npm test)
  */
 'use strict';
@@ -19,6 +22,9 @@ const path = require('path');
 const WebSocket = require('ws');
 
 const PORT = 8799;
+const MEDIA_ROOT1 = '/tmp/pi-bridge-test-media/root1';
+const MEDIA_ROOT2 = '/tmp/pi-bridge-test-media/root2';
+const MEDIA_OUTSIDE = '/tmp/pi-bridge-test-media/outside';
 const server = spawn('node', [path.join(__dirname, '..', 'server.js')], {
   env: {
     ...process.env,
@@ -27,6 +33,8 @@ const server = spawn('node', [path.join(__dirname, '..', 'server.js')], {
     PI_BRIDGE_CMD: 'node',
     PI_BRIDGE_ARGS: path.join(__dirname, 'fake-pi.js'),
     PI_BRIDGE_SESSION_DIR: '/tmp/pi-bridge-test-sessions',
+    PI_BRIDGE_MEDIA_EXT: '0',          // fake-pi не получает --extension
+    MEDIA_DIRS: MEDIA_ROOT1 + ':' + MEDIA_ROOT2,
   },
   stdio: ['ignore', 'inherit', 'inherit'],
 });
@@ -40,7 +48,7 @@ let failed = false;
 function fail(msg) { console.error('FAIL:', msg); failed = true; cleanup(1); }
 function pass(msg) { console.log('PASS:', msg); }
 
-const master = setTimeout(() => fail('общий таймаут теста'), 60000);
+const master = setTimeout(() => fail('общий таймаут теста'), 90000);
 
 /* ---------- D) md.js (чистая функция, без сервера) ---------- */
 function testMd() {
@@ -58,6 +66,59 @@ function testMd() {
   assert.ok(!xss.includes('<img'), 'XSS img экранирован');
   assert.ok(xss.includes('&lt;script&gt;'), 'XSS превращён в текст');
   pass('md.js: заголовки/списки/код/инлайн/ссылки + XSS-экранирование');
+}
+
+/* ---------- I) media-card.js (чистая функция, stub-DOM без браузера) ---------- */
+function testMediaCard(){
+  const mc = require(path.join(__dirname, '..', 'media-card.js'));
+  // минимальный stub document.createElement — достаточно для media-card.js
+  const doc = { createElement(tag){
+    return {
+      tag, children: [], className: '', textContent: '', parentNode: null,
+      appendChild(c){ c.parentNode = this; this.children.push(c); return c; },
+      replaceChild(n, o){ const i = this.children.indexOf(o); if (i >= 0) this.children[i] = n; n.parentNode = this; o.parentNode = null; },
+    };
+  } };
+  // 1) оболочка (инструмент ещё работает)
+  const shell = mc.create(doc, null);
+  assert.strictEqual(shell.className, 'media-card', 'класс оболочки');
+  assert.strictEqual(shell.children[0].textContent, 'медиа…', 'summary оболочки');
+  // 2) полная карточка: аудио + картинки + битый путь
+  const items = [
+    { ok: true, kind: 'audio', path: 'suno/a.m4a', url: '/media?path=suno%2Fa.m4a', title: 'Трек А' },
+    { ok: true, kind: 'image', path: 'p1.png', url: '/media?path=p1.png' },
+    { ok: true, kind: 'image', path: 'p2.png', url: '/media?path=p2.png' },
+    { ok: false, path: 'x.txt', error: 'расширение .txt не в белом списке' },
+  ];
+  const card = mc.create(doc, items);
+  const sum = card.children[0];
+  assert.strictEqual(sum.textContent, 'медиа 3: 1 аудио · 2 картинки', 'summary карточки: ' + sum.textContent);
+  const kinds = { audio: 0, img: 0 };
+  (function walk(n){
+    (n.children || []).forEach(ch => {
+      if (ch.tag === 'audio') kinds.audio++;
+      if (ch.tag === 'img'){ kinds.img++; assert.strictEqual(ch.loading, 'lazy', 'img loading=lazy'); }
+      walk(ch);
+    });
+  })(card);
+  assert.strictEqual(kinds.audio, 1, 'один <audio>');
+  assert.strictEqual(kinds.img, 2, 'две <img> в гриде');
+  const miss = card.children.filter(c => c.className === 'media-miss');
+  assert.strictEqual(miss.length, 1, 'одна строка «недоступно»');
+  assert.ok(miss[0].textContent.includes('x.txt') && miss[0].textContent.includes('белом списке'), 'текст miss-строки');
+  // 3) onerror: аудио заменяется на «файл недоступен»
+  let audioEl = null;
+  (function walk(n){ (n.children || []).forEach(ch => { if (ch.tag === 'audio' && !audioEl) audioEl = ch; walk(ch); }); })(card);
+  assert.ok(audioEl && audioEl.onerror, 'onerror навешан');
+  const parent = audioEl.parentNode;
+  audioEl.onerror();
+  assert.ok(parent.children.some(c => c.className === 'media-miss' && c.textContent.includes('недоступен')), 'onerror → «файл недоступен»');
+  assert.ok(!parent.children.some(c => c.tag === 'audio'), 'битое аудио удалено из DOM');
+  // 4) ничего не доставлено + склонение
+  assert.strictEqual(mc.summaryText([{ ok: false, path: 'p', error: 'e' }]), 'медиа: ничего не доставлено', 'пустая карточка');
+  assert.ok(mc.summaryText(Array.from({ length: 5 }, () => ({ ok: true, kind: 'image', url: 'u' }))).includes('5 картинок'), 'склонение 5');
+  assert.ok(mc.summaryText([{ ok: true, kind: 'video', url: 'v' }]).includes('1 видео'), 'видео в summary');
+  pass('media-card.js: оболочка, summary/склонения, audio/img/video, miss-строки, onerror-замена');
 }
 
 /* ---------- подключение клиента с накоплением событий ---------- */
@@ -105,6 +166,7 @@ async function waitReady() {
 
 async function main() {
   testMd();
+  testMediaCard();
   await waitReady();
 
   /* ---------- A) базовый цикл ---------- */
@@ -344,6 +406,150 @@ async function main() {
   assert.strictEqual(stT.data.thinkingLevel, 'high', 'уровень мышления сменился');
   pass('I: мышление — список уровней + установка high подтверждается get_state');
   i.close();
+
+  /* ---------- J) GET /media: 200/206/416/403/404/304/HEAD/dl ---------- */
+  const fsp2 = require('fs').promises;
+  await fsp2.mkdir(MEDIA_ROOT1 + '/suno', { recursive: true });
+  await fsp2.mkdir(MEDIA_ROOT2, { recursive: true });
+  await fsp2.mkdir(MEDIA_OUTSIDE, { recursive: true });
+  const buf256 = Buffer.from(Array.from({ length: 256 }, (_, i) => i % 256));
+  await fsp2.writeFile(MEDIA_ROOT1 + '/track.m4a', buf256);
+  await fsp2.writeFile(MEDIA_ROOT1 + '/suno/clip.mp3', Buffer.alloc(100, 7));
+  await fsp2.writeFile(MEDIA_ROOT1 + '/pic.png', Buffer.alloc(64, 3));
+  await fsp2.writeFile(MEDIA_ROOT2 + '/second.wav', Buffer.alloc(10, 9));
+  await fsp2.writeFile(MEDIA_ROOT1 + '/note.txt', 'секрет');
+  await fsp2.writeFile(MEDIA_ROOT1 + '/empty.m4a', '');
+  await fsp2.writeFile(MEDIA_OUTSIDE + '/secret.txt', 'не должен отдаваться');
+  try { await fsp2.unlink(MEDIA_ROOT1 + '/link-out.m4a'); } catch {}
+  await fsp2.symlink(MEDIA_OUTSIDE + '/secret.txt', MEDIA_ROOT1 + '/link-out.m4a');
+
+  const murl = (q) => 'http://127.0.0.1:' + PORT + '/media?path=' + encodeURIComponent(q);
+  const absTrack = MEDIA_ROOT1 + '/track.m4a';
+
+  let r = await fetch(murl(absTrack));
+  assert.strictEqual(r.status, 200, '200 на абсолютный путь');
+  assert.strictEqual(r.headers.get('content-type'), 'audio/mp4', 'MIME по расширению');
+  assert.strictEqual(r.headers.get('accept-ranges'), 'bytes', 'Accept-Ranges на 200');
+  assert.ok(r.headers.get('etag'), 'ETag есть');
+  assert.strictEqual(r.headers.get('x-content-type-options'), 'nosniff', 'nosniff');
+  assert.strictEqual(r.headers.get('content-security-policy'), "default-src 'none'", 'CSP на /media');
+  assert.strictEqual(r.headers.get('cache-control'), 'private, max-age=3600', 'Cache-Control');
+  const body1 = Buffer.from(await r.arrayBuffer());
+  assert.ok(body1.equals(buf256), 'тело 200 == файл целиком');
+  const etag1 = r.headers.get('etag');
+  pass('J: 200 по абсолютному пути, MIME/заголовки/тело');
+
+  r = await fetch(murl('track.m4a'));
+  assert.strictEqual(r.status, 200, 'относительный путь резолвится по первому корню');
+  r = await fetch(murl('suno/clip.mp3'));
+  assert.strictEqual(r.status, 200, 'подкаталог: 200');
+  assert.strictEqual(r.headers.get('content-type'), 'audio/mpeg', 'подкаталог + audio/mpeg');
+  r = await fetch(murl('second.wav'));
+  assert.strictEqual(r.status, 200, 'второй корень: 200');
+  assert.strictEqual(r.headers.get('content-type'), 'audio/wav', 'второй корень MEDIA_DIRS');
+  pass('J: относительные пути и второй корень');
+
+  r = await fetch(murl(absTrack), { headers: { Range: 'bytes=0-9' } });
+  assert.strictEqual(r.status, 206, '206 на корректный диапазон');
+  assert.strictEqual(r.headers.get('content-range'), 'bytes 0-9/256', 'Content-Range 0-9');
+  assert.ok(Buffer.from(await r.arrayBuffer()).equals(buf256.subarray(0, 10)), 'тело 206 — первые 10 байт');
+  r = await fetch(murl(absTrack), { headers: { Range: 'bytes=-5' } });
+  assert.strictEqual(r.status, 206, 'suffix-диапазон: 206');
+  assert.strictEqual(r.headers.get('content-range'), 'bytes 251-255/256', 'suffix Content-Range');
+  assert.ok(Buffer.from(await r.arrayBuffer()).equals(buf256.subarray(251)), 'suffix — последние 5 байт');
+  r = await fetch(murl(absTrack), { headers: { Range: 'bytes=10-' } });
+  assert.strictEqual(r.status, 206, 'открытый диапазон: 206');
+  assert.strictEqual(r.headers.get('content-range'), 'bytes 10-255/256', 'открытый Content-Range');
+  pass('J: Range — a-b, -suffix, открытый');
+
+  r = await fetch(murl(absTrack), { headers: { Range: 'bytes=999999-' } });
+  assert.strictEqual(r.status, 416, 'за пределами: 416');
+  assert.strictEqual(r.headers.get('content-range'), 'bytes */256', '416 + Content-Range */size');
+  r = await fetch(murl(absTrack), { headers: { Range: 'bytes=zz' } });
+  assert.strictEqual(r.status, 416, 'мусорный Range → 416');
+  r = await fetch(murl(absTrack), { headers: { Range: 'bytes=5-2' } });
+  assert.strictEqual(r.status, 416, 'start>end → 416');
+  r = await fetch(murl(MEDIA_ROOT1 + '/empty.m4a'), { headers: { Range: 'bytes=0-' } });
+  assert.strictEqual(r.status, 416, 'Range на пустом файле → 416');
+  pass('J: 416 — за пределами, мусор, инверсия, пустой файл');
+
+  r = await fetch(murl(absTrack), { headers: { 'If-None-Match': etag1 } });
+  assert.strictEqual(r.status, 304, '304 по If-None-Match/ETag');
+  assert.strictEqual((await r.arrayBuffer()).byteLength, 0, '304 без тела');
+  pass('J: 304 по ETag');
+
+  r = await fetch(murl('/etc/hostname'));
+  assert.strictEqual(r.status, 403, 'абсолютный путь вне корней → 403');
+  r = await fetch(murl('../outside/secret.txt'));
+  assert.strictEqual(r.status, 403, 'относительный traversal → 403');
+  r = await fetch(murl(MEDIA_ROOT1 + '/link-out.m4a'));
+  assert.strictEqual(r.status, 403, 'симлинк наружу → 403');
+  r = await fetch(murl('note.txt'));
+  assert.strictEqual(r.status, 403, 'расширение вне whitelist → 403');
+  r = await fetch(murl('suno'));
+  assert.strictEqual(r.status, 403, 'каталог не отдаётся → 403');
+  const secretCheck = await fetch(murl(MEDIA_OUTSIDE + '/secret.txt'));
+  assert.strictEqual(secretCheck.status, 403, 'файл вне корней напрямую → 403');
+  pass('J: 403 — traversal, симлинк, не-медиа расширение, каталог');
+
+  r = await fetch(murl('missing.m4a'));
+  assert.strictEqual(r.status, 404, 'несуществующий файл → 404');
+  r = await fetch(murl(absTrack), { method: 'HEAD' });
+  assert.strictEqual(r.status, 200, 'HEAD: 200');
+  assert.strictEqual(r.headers.get('content-length'), '256', 'HEAD: Content-Length');
+  assert.strictEqual(r.headers.get('accept-ranges'), 'bytes', 'HEAD: Accept-Ranges');
+  assert.strictEqual((await r.arrayBuffer()).byteLength, 0, 'HEAD без тела');
+  r = await fetch(murl(absTrack) + '&dl=1');
+  assert.ok(String(r.headers.get('content-disposition') || '').startsWith("attachment; filename*=UTF-8''"), 'dl=1 → attachment');
+  pass('J: 404, HEAD, dl=1');
+
+  /* ---------- K) send_media: тул-события, карточка, ресинк из истории ---------- */
+  const j = makeClient('K');
+  await j.waitFor(o => o.type === 'bridge_hello', 'hello J');
+  await j.waitFor(o => o.type === 'response' && o.command === 'get_messages', 'get_messages J');
+  const itemsJ = [
+    { kind: 'audio', path: MEDIA_ROOT1 + '/track.m4a', title: 'Трек декабря' },   // абсолютный
+    { kind: 'image', path: 'pic.png' },                                            // относительный
+    { kind: 'audio', path: MEDIA_ROOT1 + '/no-such.m4a', title: 'битый' },         // не существует
+  ];
+  j.send(JSON.stringify({ id: 'j1', type: 'prompt', message: 'media:' + JSON.stringify(itemsJ) }));
+  const tJ = j.events.length;
+  await j.waitFor(o => o.type === 'agent_settled' && j.events.indexOf(o) >= tJ, 'agent_settled (J)');
+
+  const teJ = j.events.slice(tJ).find(o => o.type === 'tool_execution_end' && o.toolName === 'send_media');
+  assert.ok(teJ, 'tool_execution_end send_media дошёл до клиента');
+  assert.ok(teJ.result && Array.isArray(teJ.result.details.items), 'details.items в результате');
+  const detJ = teJ.result.details.items;
+  assert.strictEqual(detJ.length, 3, '3 элемента');
+  assert.strictEqual(detJ[0].ok, true, 'абсолютный путь прошёл');
+  assert.strictEqual(detJ[0].url, '/media?path=' + encodeURIComponent('track.m4a'),
+    'абсолютный путь → относительный URL: ' + JSON.stringify(detJ[0]));
+  assert.strictEqual(detJ[1].ok, true, 'относительный путь прошёл');
+  assert.strictEqual(detJ[1].url, '/media?path=pic.png', 'относительный путь сохранён в URL');
+  assert.strictEqual(detJ[2].ok, false, 'битый путь помечен ok:false');
+  assert.ok(detJ[2].error, 'ошибка для модели присутствует');
+  const tsJ = j.events.slice(tJ).find(o => o.type === 'tool_execution_start' && o.toolName === 'send_media');
+  assert.ok(tsJ && tsJ.args && tsJ.args.items.length === 3, 'tool_execution_start несёт args.items (карточка строится сразу)');
+  pass('K: тул-события send_media ретранслируются с details.items и URL /media');
+
+  // ресинк: новый клиент получает историю с toolCall-блоком и toolResult с details
+  const j2 = makeClient('K2');
+  await j2.waitFor(o => o.type === 'bridge_hello', 'hello J2');
+  const msgsJ = await j2.waitFor(o => o.type === 'response' && o.command === 'get_messages', 'get_messages J2');
+  const msgs = msgsJ.data.messages;
+  const asstIdx = msgs.findIndex(m => m.role === 'assistant' &&
+    Array.isArray(m.content) && m.content.some(b => (b.type === 'toolCall' || b.type === 'toolcall') && (b.name === 'send_media' || b.toolName === 'send_media')));
+  assert.ok(asstIdx >= 0, 'в истории есть assistant с toolCall send_media');
+  const tcJ = msgs[asstIdx].content.find(b => (b.type === 'toolCall' || b.type === 'toolcall') && (b.name === 'send_media' || b.toolName === 'send_media'));
+  assert.ok(tcJ.id && Array.isArray(tcJ.arguments.items) && tcJ.arguments.items.length === 3, 'toolCall.arguments.items персистентны');
+  const trIdx = msgs.findIndex(m => (m.role === 'toolResult' || m.role === 'tool') && m.toolCallId === tcJ.id);
+  assert.ok(trIdx > asstIdx, 'в истории есть toolResult по тому же toolCallId');
+  assert.strictEqual(msgs[trIdx].toolName, 'send_media', 'toolName у toolResult');
+  assert.ok(msgs[trIdx].details && msgs[trIdx].details.items && msgs[trIdx].details.items.length === 3,
+    'details.items персистентны (карточка восстановится по ним)');
+  assert.strictEqual(msgs[trIdx].details.items[0].url, detJ[0].url, 'URL в истории совпадает с живым');
+  pass('K: ресинк — карточка восстанавливается из toolCall+toolResult (дедуп по toolCallId)');
+  j.close(); j2.close();
 
   clearTimeout(master);
   console.log('SMOKE OK');

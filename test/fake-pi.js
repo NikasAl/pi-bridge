@@ -15,6 +15,8 @@ const argv = process.argv.slice(2);
 function argVal(name) { const i = argv.indexOf(name); return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null; }
 const SESSION_DIR = argVal('--session-dir') || '/tmp';
 const SESSION_FILE = argVal('--session') || path.join(SESSION_DIR, 'fake-' + Date.now() + '_' + process.pid + '.jsonl');
+// первый корень MEDIA_DIRS — фейковый резолвер путей send_media (как реальный execute)
+const MEDIA_ROOT_FAKE = String(process.env.MEDIA_DIRS || '').split(':').map(s => s.trim()).filter(Boolean)[0] || '/tmp';
 
 let entrySeq = 0;
 let fileLastId = null;
@@ -52,6 +54,9 @@ initSessionFile();
 
 let streaming = false;
 let sessionName = null;
+let mediaSeq = 0;
+const historyExtra = [];         // сообщения после базовой тройки (для ресинка media-кейса)
+function pushHistory(m) { historyExtra.push(m); }
 
 // состояние модели/мышления для тестов «выбора модели»
 const MODELS = [
@@ -68,6 +73,56 @@ function respond(id, command, success, data, error) {
   const r = { id, type: 'response', command, success };
   if (success) r.data = data; else r.error = error || 'error';
   emit(r);
+}
+
+function resolveMediaItem(it) {
+  const p = String((it && it.path) || '').trim();
+  let real = null;
+  try { real = fs.realpathSync(p.startsWith('/') ? p : path.resolve(MEDIA_ROOT_FAKE, p)); } catch {}
+  if (!real) return { ok: false, kind: it && it.kind, path: p, title: it && it.title, error: 'файл не найден' };
+  let st;
+  try { st = fs.statSync(real); } catch { return { ok: false, path: p, error: 'не читается' }; }
+  if (!st.isFile()) return { ok: false, path: p, error: 'не обычный файл' };
+  const disp = p.startsWith('/') ? (path.relative(MEDIA_ROOT_FAKE, real) || path.basename(real)) : p;
+  return { ok: true, kind: (it && it.kind) || 'audio', path: disp, url: '/media?path=' + encodeURIComponent(disp), title: (it && it.title) || '', size: st.size };
+}
+
+/* сценарий «media:» + JSON-массив items — эмуляция вызова send_media:
+ * tool-события в стриме + полноценные записи в файле/истории сессии */
+function runMedia(id, message) {
+  let items = [];
+  try { items = JSON.parse(message.slice(6)); } catch {}
+  if (!Array.isArray(items) || !items.length) items = [{ kind: 'audio', path: '/nonexistent/a.m4a', title: 'битый путь' }];
+  streaming = true;
+  emit({ type: 'agent_start' });
+  appendEntry({ role: 'user', content: message, timestamp: Date.now() });
+  pushHistory({ role: 'user', content: message, timestamp: Date.now() });
+  emit({ type: 'message_start', message: { role: 'user', content: message, timestamp: Date.now() } });
+  emit({ type: 'message_update', assistantMessageEvent: { type: 'text_start', contentIndex: 0 } });
+  emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'Подбираю медиа… ' } });
+  emit({ type: 'message_update', assistantMessageEvent: { type: 'text_end', contentIndex: 0, content: 'Подбираю медиа…' } });
+  const callId = 'call_media_' + (++mediaSeq);
+  emit({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_start', contentIndex: 1, id: callId, toolName: 'send_media' } });
+  emit({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_end', contentIndex: 1, toolCall: { id: callId, name: 'send_media', arguments: { items } } } });
+  emit({ type: 'tool_execution_start', toolCallId: callId, toolName: 'send_media', args: { items } });
+  const out = items.map(resolveMediaItem);
+  const okCount = out.filter(i => i.ok).length;
+  const result = { content: [{ type: 'text', text: 'Готово к отправке: ' + okCount + ' из ' + out.length + '.' }], details: { items: out } };
+  emit({ type: 'tool_execution_end', toolCallId: callId, toolName: 'send_media', result, isError: okCount === 0 });
+  const assistantMsg = { role: 'assistant', content: [
+    { type: 'text', text: 'Подбираю медиа…' },
+    { type: 'toolCall', id: callId, name: 'send_media', arguments: { items } },
+  ], timestamp: Date.now() };
+  const toolResultMsg = { role: 'toolResult', toolCallId: callId, toolName: 'send_media', content: result.content, details: result.details, isError: okCount === 0, timestamp: Date.now() };
+  appendEntry(assistantMsg);
+  appendEntry(toolResultMsg);
+  pushHistory(assistantMsg);
+  pushHistory(toolResultMsg);
+  emit({ type: 'message_end', message: { role: 'assistant' } });
+  emit({ type: 'agent_end', messages: [], willRetry: false });
+  emit({ type: 'agent_settled', aborted: false });
+  streaming = false;
+  respond(id, 'prompt', true, { disposition: 'started' });
 }
 
 function runPrompt(id, message, images) {
@@ -163,7 +218,7 @@ process.stdin.on('data', (c) => {
             { type: 'text', text: 'Смотри фото из истории' },
             { type: 'image', data: 'HISTIMGBASE64DATA', mimeType: 'image/png' },
           ] },
-        ] });
+        ].concat(historyExtra) });
         break;
       case 'prompt':
         if (streaming && !cmd.streamingBehavior) {
@@ -171,7 +226,8 @@ process.stdin.on('data', (c) => {
         } else if (cmd.streamingBehavior) {
           respond(cmd.id, 'prompt', true, { disposition: 'queued' });
         } else {
-          runPrompt(cmd.id, cmd.message || '', cmd.images);
+          if (/^media:/.test(cmd.message || '')) runMedia(cmd.id, cmd.message);
+          else runPrompt(cmd.id, cmd.message || '', cmd.images);
         }
         break;
       case 'steer':
