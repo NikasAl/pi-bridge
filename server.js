@@ -759,6 +759,11 @@ const server = http.createServer((req, res) => {
     fs.createReadStream(path.join(__dirname, 'md.js')).pipe(res);
     return;
   }
+  if (req.method === 'GET' && req.url === '/media-card.js') {
+    res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8' });
+    fs.createReadStream(path.join(__dirname, 'media-card.js')).pipe(res);
+    return;
+  }
   if (req.method === 'GET' && req.url === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, cwd: CWD, sessions: sessionList() }));

@@ -113,6 +113,18 @@
   .uimgs > *{margin:0 6px 6px 0;display:inline-block;vertical-align:top}
   .uimgs img{max-width:150px;max-height:110px;border-radius:8px;display:block}
   .imgstub{border:1px dashed var(--line);border-radius:8px;padding:3px 8px;font-size:12px;color:var(--dim)}
+  /* медиа-карточка send_media (аудио/картинки/видео с хоста) */
+  .media-card{border:1px solid var(--line);border-radius:10px;padding:6px 10px;margin:6px 0;background:rgba(255,255,255,.02)}
+  .media-card summary{cursor:pointer;color:var(--text);font-size:13px;font-weight:600;list-style:none}
+  .media-audio,.media-video{margin:2px 0 4px}
+  .media-row{margin:8px 0}
+  .media-title{font-size:12.5px;color:var(--dim);margin-bottom:2px;overflow-wrap:anywhere}
+  .media-audio audio{width:100%;height:36px;display:block}
+  .media-video video{width:100%;max-width:480px;border-radius:8px;display:block}
+  .media-grid{margin:8px 0}
+  .media-grid > *{margin:0 6px 6px 0;display:inline-block;vertical-align:top}
+  .media-grid img{max-width:280px;max-height:280px;border-radius:8px;display:block}
+  .media-miss{color:var(--err);font-size:12px;font-family:var(--mono);display:block;margin:4px 0;overflow-wrap:anywhere}
   /* панель сессий */
   #drawer{
     display:none;position:fixed;z-index:10;left:0;right:0;top:0;
@@ -230,6 +242,7 @@
 </div>
 
 <script src="md.js"></script>
+<script src="media-card.js"></script>
 <script>
 // полифилл <details>/<summary> для Safari < 12.1 (стара iOS): кликом по summary
 // тумбулится класс .xopen, CSS скрывает/показывает содержимое
@@ -265,6 +278,9 @@ const statusState = { model: null, modelId: null, provider: null, think: null, c
 let availableModels = [];          // все настроенные модели pi [{id,name,provider,...}]
 let thinkingLevels = [];           // уровни мышления текущей модели
 const toolLines = new Map();    // toolCallId -> элемент строки инструмента
+const mediaCards = new Map();        // toolCallId -> live-оболочка карточки send_media
+const pendingMediaArgs = new Map();  // toolCallId -> items из toolCall-блока (история/до результата)
+const renderedMedia = new Set();     // дедуп карточек по toolCallId
 
 /* ---------- утилиты DOM ---------- */
 function scrollBottom(){ logEl.scrollTop = logEl.scrollHeight; }
@@ -393,6 +409,9 @@ function toolLineEnd(id, isError, resultText){
 function rebuildLog(messages){
   logEl.textContent = '';
   toolLines.clear();
+  mediaCards.clear();
+  pendingMediaArgs.clear();
+  renderedMedia.clear();
   closeStreams();
   lastSent = '';
   stick = true;
@@ -421,18 +440,65 @@ function renderHistoryMessage(m){
         if (b.type === 'text' && b.text) add(mdBlock(b.text));
         else if (b.type === 'thinking' && b.thinking) add(div('row thinking', short(b.thinking, 800)));
         else if (/toolcall|tool_call|toolCall/.test(b.type || '')){
-          toolLineStart(null, b.name || b.toolName || 'tool', b.arguments || b.args || null);
+          const nm = b.name || b.toolName || 'tool';
+          const bid = b.id || b.callId || null;
+          if (nm === 'send_media'){
+            // карточку отрендерит следующий toolResult (там готовые URL из execute)
+            if (bid) pendingMediaArgs.set(bid, (b.arguments || b.args || {}).items || []);
+          } else toolLineStart(null, nm, b.arguments || b.args || null);
         } else add(rawDetails('блок ' + (b.type || '?'), b));
       }
     } else if (contentText(content)) add(mdBlock(contentText(content)));
     return;
   }
   if (/tool/i.test(role || '')){
+    if ((m.toolName || m.tool_name) === 'send_media'){
+      renderMediaCard(m.toolCallId || m.tool_call_id || null, m.details && m.details.items,
+        m.toolCallId ? pendingMediaArgs.get(m.toolCallId) : null);
+      return;
+    }
     const t = contentText(content);
     if (t) add(div('sys', 'результат инструмента: ' + short(t, 300)));
     return;
   }
   add(rawDetails('роль ' + (role || '?'), m));
+}
+
+/* ---------- медиа-карточки send_media ---------- */
+function renderMediaCard(id, detailItems, argItems){
+  if (id && renderedMedia.has(id)) return null;
+  let items = Array.isArray(detailItems) && detailItems.length ? detailItems : null;
+  if (!items && Array.isArray(argItems) && argItems.length){
+    // результата нет (ход оборвался и т.п.) — собираем URL из путей;
+    // битые пути покажет onerror («файл недоступен»)
+    items = argItems.map(a => ({
+      ok: true, kind: a.kind, path: a.path, title: a.title, note: a.note,
+      url: '/media?path=' + encodeURIComponent(a.path || ''),
+    }));
+  }
+  const el = window.piMediaCard.create(document, items);
+  add(el);
+  if (id) renderedMedia.add(id);
+  return el;
+}
+function startMediaCard(id){
+  if (id && renderedMedia.has(id)) return null;   // карточка уже собрана (rebuild опередил)
+  let shell = id && mediaCards.get(id);
+  if (!shell){
+    shell = window.piMediaCard.create(document, null);
+    if (id) mediaCards.set(id, shell);
+    add(shell);
+  }
+  return shell;
+}
+function finishMediaCard(id, details){
+  const argItems = (id && pendingMediaArgs.get(id)) || null;
+  const card = renderMediaCard(id, details && details.items, argItems);
+  const shell = id && mediaCards.get(id);
+  if (shell && card && card !== shell){
+    try { shell.replaceWith(card); } catch (e) { /* оболочка уже не в DOM */ }
+  }
+  if (id){ mediaCards.delete(id); pendingMediaArgs.delete(id); }
 }
 
 /* ---------- иконки (инлайновые SVG, без CDN) ---------- */
@@ -542,10 +608,23 @@ function handleEvent(o){
         case 'thinking_start': curText = null; ensureThink(); break;
         case 'thinking_delta': ensureThink().textContent += e.delta || ''; break;
         case 'thinking_end': curThink = null; break;
-        case 'toolcall_start': closeStreams(); toolLineStart(e.id, e.toolName, null); break;
+        case 'toolcall_start': {
+          closeStreams();
+          if (e.toolName === 'send_media'){
+            if (e.id) pendingMediaArgs.set(e.id, []);
+            startMediaCard(e.id);          // оболочка «медиа…», финал — в tool_execution_end
+            break;
+          }
+          toolLineStart(e.id, e.toolName, null);
+          break;
+        }
         case 'toolcall_delta': break; // накопление аргументов не показываем
         case 'toolcall_end': {
           const tc = e.toolCall || {};
+          if (tc.name === 'send_media'){
+            if (e.id) pendingMediaArgs.set(e.id, (tc.arguments || {}).items || []);
+            break;                         // карточку завершит tool_execution_end
+          }
           const d = e.id && toolLines.get(e.id);
           if (d){
             const pre = d.children[2];
@@ -559,10 +638,12 @@ function handleEvent(o){
       break;
     }
     case 'tool_execution_start':
+      if (o.toolName === 'send_media'){ startMediaCard(o.toolCallId); break; }
       toolLineStart(o.toolCallId, o.toolName, o.args);
       break;
     case 'tool_execution_update': break; // частичный вывод не спамим в лог
     case 'tool_execution_end': {
+      if (o.toolName === 'send_media'){ finishMediaCard(o.toolCallId, o.result && o.result.details); break; }
       const r = o.result || {};
       const text = Array.isArray(r.content)
         ? r.content.filter(b => b && b.type === 'text').map(b => b.text).join('\n')
