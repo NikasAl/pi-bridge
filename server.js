@@ -11,7 +11,8 @@
  *     (set_session_name, персистентно в pi), удаление (kill + unlink файла
  *     сессии); первая пользовательская фраза автоматически становится именем;
  *   - plain-text от клиента оборачивается в {"type":"prompt","message":...};
- *   - отдаёт index.html, md.js на GET / и /md.js, health-check на /healthz.
+ *   - отдаёт index.html, md.js на GET / и /md.js, health-check на /healthz
+ *     и файлы хоста на GET /media?path=... (см. ниже).
  *
  * Управляющие команды клиентов (type начинается с "bridge_"):
  *   bridge_create_session            — новая сессия (новый процесс pi)
@@ -29,6 +30,9 @@
  *   PI_BRIDGE_CWD     рабочий каталог pi-сессий (по умолчанию — cwd процесса)
  *   PI_BRIDGE_CMD     команда (по умолчанию "pi"; можно "node" для фейка в тестах)
  *   PI_BRIDGE_ARGS    аргументы через пробел (по умолчанию "--mode rpc")
+ *   MEDIA_DIRS        корни, из которых GET /media отдаёт файлы (через ":",
+ *                     дефолт ~/myprjs/Ideal); те же корни использует тул
+ *                     send_media из extension/send-media.js
  *   PI_BRIDGE_SESSION_DIR  если задан — добавит "--session-dir <dir>"
  */
 'use strict';
@@ -94,6 +98,140 @@ function stripImageData(v, depth) {
     for (const k in v) stripImageData(v[k], depth + 1);
   }
   return v;
+}
+
+/* ---------- медиа с хоста: GET /media?path=... ----------
+ *
+ * Единственный канал, по которому ходят БАЙТЫ файлов: инструмент send_media
+ * (extension/send-media.js) в RPC-событиях и истории передаёт одни пути + URL.
+ *
+ * Безопасность:
+ *   - абсолютный путь после realpath обязан лежать под одним из корней MEDIA_DIRS;
+ *   - относительный резолвится по корням по порядку, с той же проверкой —
+ *     ../ и симлинки наружу отсекаются;
+ *   - расширение должно быть в MIME-белом списке (html/svg/js не отдаются вовсе); 
+ *   - каталоги и прочие не-файлы не отдаются, листинга нет;
+ *   - nosniff + CSP default-src 'none' — даже угаданный тип не исполнится.
+ * Range/206 обязателен: nginx 206 для proxy_pass не синтезирует, а iOS Safari
+ * без него ломает seek в <audio> (сначала шлёт пробу bytes=0-1). */
+
+const MEDIA_MIME = {
+  m4a: 'audio/mp4', mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', flac: 'audio/flac',
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp',
+  gif: 'image/gif', bmp: 'image/bmp', avif: 'image/avif',
+  mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+};
+
+function mediaRoots() {
+  const raw = process.env.MEDIA_DIRS || path.join(os.homedir(), 'myprjs', 'Ideal');
+  return String(raw).split(':').map(s => s.trim()).filter(Boolean).map(s => {
+    if (s === '~') return os.homedir();
+    if (s.startsWith('~/')) return path.join(os.homedir(), s.slice(2));
+    return path.resolve(s);
+  });
+}
+
+async function mediaRealRoots() {
+  const roots = mediaRoots();
+  const real = await Promise.all(roots.map(r => fs.promises.realpath(r).catch(() => null)));
+  return real.filter(Boolean);
+}
+
+function parseMediaRange(hdr, size) {
+  // null — Range нет; {start,end} — отрезок; 416 — некорректный/неудовлетворимый
+  if (!hdr) return null;
+  const m = /^bytes\s*=\s*(\d*)\s*-\s*(\d*)$/.exec(String(hdr).trim());
+  if (!m || size === 0) return 416;               // мусор (в т.ч. несколько диапазонов) или пустой файл
+  if (m[1] === '' && m[2] === '') return 416;
+  let start, end;
+  if (m[1] === '') {                              // -N: последние N байт
+    const n = parseInt(m[2], 10);
+    if (n <= 0) return 416;
+    start = Math.max(0, size - n); end = size - 1;
+  } else {
+    start = parseInt(m[1], 10);
+    end = m[2] === '' ? size - 1 : parseInt(m[2], 10);
+    if (start >= size) return 416;
+    if (end >= size) end = size - 1;
+    if (start > end) return 416;
+  }
+  return { start, end };
+}
+
+async function handleMedia(req, res, u) {
+  const plain = (code, text) => {
+    res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(text);
+  };
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405, { Allow: 'GET, HEAD', 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('method not allowed');
+  }
+  const q = u.searchParams.get('path');
+  if (!q || q.indexOf('\0') >= 0) return plain(400, 'media: нужен непустой ?path=');
+
+  const roots = await mediaRealRoots();
+  let real = null;
+  if (q.startsWith('/')) {
+    let rf = null;
+    try { rf = await fs.promises.realpath(path.resolve(q)); } catch {}
+    if (!rf || !roots.some(r => rf === r || rf.startsWith(r + path.sep))) {
+      return plain(403, 'media: путь вне MEDIA_DIRS');
+    }
+    real = rf;
+  } else {
+    for (const r of roots) {
+      let rf = null;
+      try { rf = await fs.promises.realpath(path.resolve(r, q)); } catch { continue; }
+      if (rf === r || rf.startsWith(r + path.sep)) { real = rf; break; }
+    }
+    if (!real) return plain(403, 'media: относительный путь не разрешается внутрь MEDIA_DIRS (или файл вне корней)');
+  }
+
+  const ext = path.extname(real).slice(1).toLowerCase();
+  const mime = MEDIA_MIME[ext];
+  if (!mime) return plain(403, 'media: расширение .' + (ext || '?') + ' не в белом списке');
+
+  let st;
+  try { st = await fs.promises.stat(real); } catch { return plain(404, 'media: файл не найден'); }
+  if (!st.isFile()) return plain(403, 'media: не обычный файл');
+
+  const etag = '"' + st.size + '-' + st.mtimeMs + '"';
+  const headers = {
+    'Content-Type': mime,
+    'Accept-Ranges': 'bytes',
+    'ETag': etag,
+    'Cache-Control': 'private, max-age=3600',
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'",
+  };
+  const inm = req.headers['if-none-match'];
+  if (inm && String(inm).split(',').map(s => s.trim()).indexOf(etag) >= 0) {
+    res.writeHead(304, headers);
+    return res.end();
+  }
+  if (u.searchParams.get('dl') === '1') {
+    headers['Content-Disposition'] = "attachment; filename*=UTF-8''" + encodeURIComponent(path.basename(real));
+  }
+
+  const range = parseMediaRange(req.headers.range, st.size);
+  if (range === 416) {
+    res.writeHead(416, Object.assign({ 'Content-Range': 'bytes */' + st.size }, headers));
+    return res.end('range not satisfiable');
+  }
+  if (range) {
+    headers['Content-Range'] = 'bytes ' + range.start + '-' + range.end + '/' + st.size;
+    headers['Content-Length'] = String(range.end - range.start + 1);
+    res.writeHead(206, headers);
+  } else {
+    headers['Content-Length'] = String(st.size);
+    res.writeHead(200, headers);
+  }
+  if (req.method === 'HEAD') return res.end();
+  const stream = fs.createReadStream(real, range ? { start: range.start, end: range.end } : {});
+  stream.on('error', () => { try { res.destroy(); } catch {} });
+  req.on('close', () => { try { stream.destroy(); } catch {} });
+  stream.pipe(res);
 }
 
 function sessionList() {
@@ -593,6 +731,13 @@ function handleBridgeCommand(ws, obj) {
 /* ---------- HTTP + WebSocket ---------- */
 
 const server = http.createServer((req, res) => {
+  try {
+    const u = new URL(req.url, 'http://localhost');
+    if (u.pathname === '/media') {
+      handleMedia(req, res, u).catch(() => { try { res.destroy(); } catch {} });
+      return;
+    }
+  } catch {}                                   // кривой URL — дальше отдастся 404
   if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     fs.createReadStream(path.join(__dirname, 'index.html')).pipe(res);
