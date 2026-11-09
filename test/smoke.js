@@ -85,9 +85,9 @@ function testMediaCard(){
   assert.strictEqual(shell.children[0].textContent, 'медиа…', 'summary оболочки');
   // 2) полная карточка: аудио + картинки + битый путь
   const items = [
-    { ok: true, kind: 'audio', path: 'suno/a.m4a', url: '/media?path=suno%2Fa.m4a', title: 'Трек А' },
-    { ok: true, kind: 'image', path: 'p1.png', url: '/media?path=p1.png' },
-    { ok: true, kind: 'image', path: 'p2.png', url: '/media?path=p2.png' },
+    { ok: true, kind: 'audio', path: 'suno/a.m4a', url: 'media?path=suno%2Fa.m4a', title: 'Трек А' },
+    { ok: true, kind: 'image', path: 'p1.png', url: 'media?path=p1.png' },
+    { ok: true, kind: 'image', path: 'p2.png', url: 'media?path=p2.png' },
     { ok: false, path: 'x.txt', error: 'расширение .txt не в белом списке' },
   ];
   const card = mc.create(doc, items);
@@ -522,10 +522,10 @@ async function main() {
   const detJ = teJ.result.details.items;
   assert.strictEqual(detJ.length, 3, '3 элемента');
   assert.strictEqual(detJ[0].ok, true, 'абсолютный путь прошёл');
-  assert.strictEqual(detJ[0].url, '/media?path=' + encodeURIComponent('track.m4a'),
+  assert.strictEqual(detJ[0].url, 'media?path=' + encodeURIComponent('track.m4a'),
     'абсолютный путь → относительный URL: ' + JSON.stringify(detJ[0]));
   assert.strictEqual(detJ[1].ok, true, 'относительный путь прошёл');
-  assert.strictEqual(detJ[1].url, '/media?path=pic.png', 'относительный путь сохранён в URL');
+  assert.strictEqual(detJ[1].url, 'media?path=pic.png', 'относительный путь сохранён в URL');
   assert.strictEqual(detJ[2].ok, false, 'битый путь помечен ok:false');
   assert.ok(detJ[2].error, 'ошибка для модели присутствует');
   const tsJ = j.events.slice(tJ).find(o => o.type === 'tool_execution_start' && o.toolName === 'send_media');

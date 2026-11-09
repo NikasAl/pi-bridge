@@ -84,7 +84,7 @@ function resolveMediaItem(it) {
   try { st = fs.statSync(real); } catch { return { ok: false, path: p, error: 'не читается' }; }
   if (!st.isFile()) return { ok: false, path: p, error: 'не обычный файл' };
   const disp = p.startsWith('/') ? (path.relative(MEDIA_ROOT_FAKE, real) || path.basename(real)) : p;
-  return { ok: true, kind: (it && it.kind) || 'audio', path: disp, url: '/media?path=' + encodeURIComponent(disp), title: (it && it.title) || '', size: st.size };
+  return { ok: true, kind: (it && it.kind) || 'audio', path: disp, url: 'media?path=' + encodeURIComponent(disp), title: (it && it.title) || '', size: st.size };
 }
 
 /* сценарий «media:» + JSON-массив items — эмуляция вызова send_media:

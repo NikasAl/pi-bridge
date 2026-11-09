@@ -106,7 +106,7 @@ function resolveItem(item, roots) {
     ok: true,
     kind,
     path: display,
-    url: '/media?path=' + encodeURIComponent(display),
+    url: 'media?path=' + encodeURIComponent(display),
     size: st.size,
   };
   const title = String(item.title || '').trim();
